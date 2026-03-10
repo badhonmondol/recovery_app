@@ -1,0 +1,18 @@
+{
+  "configurations": [
+    {
+      "name": "Android NDK",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "C:/Android/sdk/ndk/**",
+        "C:/Android/sdk/ndk/*/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include",
+        "C:/Android/sdk/ndk/*/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/aarch64-linux-android"
+      ],
+      "defines": ["__ANDROID__", "__ANDROID_API__=21"],
+      "cStandard": "c17",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "linux-clang-arm64"
+    }
+  ],
+  "version": 4
+}

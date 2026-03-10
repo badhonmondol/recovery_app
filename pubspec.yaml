@@ -1,0 +1,34 @@
+name: recovery_app
+description: "DeepRecover - Android File Recovery App"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.3
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  ffi: ^2.2.0
+  video_player: ^2.8.3
+  video_thumbnail: ^0.5.3
+  photo_view: ^0.15.0
+  intl: ^0.19.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.13.1   # add this line
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/images/recovery_app.png"
+  adaptive_icon_background: "#080C14"
+  # adaptive_icon_foreground is removed – the package will use image_path as foreground
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/recovery_app.png            # add this to include the image in assets

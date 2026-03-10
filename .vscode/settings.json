@@ -1,0 +1,6 @@
+{
+  "C_Cpp.errorSquiggles": "disabled",
+  "C_Cpp.default.intelliSenseMode": "linux-clang-arm64",
+  "C_Cpp.default.cppStandard": "c++17",
+  "files.associations": { "*.cpp": "cpp", "*.h": "cpp" }
+}
