@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 import 'dart:isolate';
 import 'package:flutter/material.dart';
@@ -8,40 +9,99 @@ import 'package:photo_view/photo_view.dart';
 import 'package:video_player/video_player.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 
-// ─────────────────────────────────────────────
-//  Models
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  THUMBNAIL CACHE  (LRU, max 200 entries)
+// ══════════════════════════════════════════════════════
+
+class _ThumbCache {
+  static final LinkedHashMap<String, Uint8List?> _map = LinkedHashMap();
+  static final Map<String, Future<Uint8List?>> _pending = {};
+  static const int _max = 200;
+
+  static Future<Uint8List?> get(String path) async {
+    if (_map.containsKey(path)) {
+      final v = _map.remove(path);
+      _map[path] = v;
+      return v;
+    }
+    if (_pending.containsKey(path)) {
+      return _pending[path];
+    }
+    final fut = _gen(path);
+    _pending[path] = fut;
+    final result = await fut;
+    _pending.remove(path);
+    if (_map.length >= _max) {
+      _map.remove(_map.keys.first);
+    }
+    _map[path] = result;
+    return result;
+  }
+
+  static Future<Uint8List?> _gen(String path) async {
+    try {
+      return await VideoThumbnail.thumbnailData(
+        video: path,
+        imageFormat: ImageFormat.JPEG,
+        maxWidth: 256,
+        quality: 65,
+        timeMs: 500,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  MODELS
+// ══════════════════════════════════════════════════════
 
 enum FileType { image, video, audio, document, other }
 
 extension FTP on FileType {
   IconData get icon {
     switch (this) {
-      case FileType.image:    return Icons.image_rounded;
-      case FileType.video:    return Icons.videocam_rounded;
-      case FileType.audio:    return Icons.audiotrack_rounded;
-      case FileType.document: return Icons.description_rounded;
-      case FileType.other:    return Icons.insert_drive_file_rounded;
+      case FileType.image:
+        return Icons.image_rounded;
+      case FileType.video:
+        return Icons.videocam_rounded;
+      case FileType.audio:
+        return Icons.audiotrack_rounded;
+      case FileType.document:
+        return Icons.description_rounded;
+      case FileType.other:
+        return Icons.insert_drive_file_rounded;
     }
   }
 
   Color get color {
     switch (this) {
-      case FileType.image:    return const Color(0xFF00E5FF);
-      case FileType.video:    return const Color(0xFFFF4081);
-      case FileType.audio:    return const Color(0xFFFFD740);
-      case FileType.document: return const Color(0xFF69FF47);
-      case FileType.other:    return const Color(0xFFE040FB);
+      case FileType.image:
+        return const Color(0xFF00E5FF);
+      case FileType.video:
+        return const Color(0xFFFF4081);
+      case FileType.audio:
+        return const Color(0xFFFFD740);
+      case FileType.document:
+        return const Color(0xFF69FF47);
+      case FileType.other:
+        return const Color(0xFFE040FB);
     }
   }
 
   String get label {
     switch (this) {
-      case FileType.image:    return 'Images';
-      case FileType.video:    return 'Videos';
-      case FileType.audio:    return 'Audio';
-      case FileType.document: return 'Docs';
-      case FileType.other:    return 'Other';
+      case FileType.image:
+        return 'Images';
+      case FileType.video:
+        return 'Videos';
+      case FileType.audio:
+        return 'Audio';
+      case FileType.document:
+        return 'Docs';
+      case FileType.other:
+        return 'Other';
     }
   }
 }
@@ -66,68 +126,51 @@ class RFile {
   });
 
   String get sizeLabel {
-    if (size <= 0)                 return '---';
-    if (size < 1024)               return '${size}B';
-    if (size < 1024 * 1024)        return '${(size / 1024).toStringAsFixed(1)}KB';
-    if (size < 1024 * 1024 * 1024) return '${(size / 1048576).toStringAsFixed(1)}MB';
-    return '${(size / 1073741824).toStringAsFixed(1)}GB';
+    if (size <= 0) return '---';
+    if (size < 1024) return '$size B';
+    if (size < 1048576) return '${(size / 1024).toStringAsFixed(1)} KB';
+    if (size < 1073741824) return '${(size / 1048576).toStringAsFixed(1)} MB';
+    return '${(size / 1073741824).toStringAsFixed(1)} GB';
   }
 
   String get dateLabel {
     if (modifiedDate == null) return '';
-    return DateFormat('dd MMM yyyy, hh:mm a').format(modifiedDate!);
+    return DateFormat('dd MMM yyyy  hh:mm a').format(modifiedDate!);
+  }
+
+  String get shortDate {
+    if (modifiedDate == null) return '';
+    return DateFormat('dd/MM/yy').format(modifiedDate!);
   }
 
   bool get isImage => type == FileType.image;
   bool get isVideo => type == FileType.video;
 }
 
-extension CA on Color {
+extension _CA on Color {
   Color withA(double a) => withValues(alpha: a);
 }
 
-// ─────────────────────────────────────────────
-//  Thumbnail Cache
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  SORT OPTIONS
+// ══════════════════════════════════════════════════════
 
-class ThumbnailCache {
-  static final Map<String, Uint8List?> _cache = {};
-  static final Map<String, Future<Uint8List?>> _pending = {};
+enum SortBy { date, name, size, type }
 
-  static Future<Uint8List?> get(String path) async {
-    if (_cache.containsKey(path)) return _cache[path];
-    if (_pending.containsKey(path)) return _pending[path];
+// ══════════════════════════════════════════════════════
+//  ISOLATE SCANNER
+// ══════════════════════════════════════════════════════
 
-    final future = VideoThumbnail.thumbnailData(
-      video: path,
-      imageFormat: ImageFormat.JPEG,
-      maxWidth: 200,
-      quality: 60,
-      timeMs: 1000,
-    );
-    _pending[path] = future;
-    final result = await future;
-    _cache[path] = result;
-    _pending.remove(path);
-    return result;
-  }
-}
-
-// ─────────────────────────────────────────────
-//  Background Scanner (Isolate)
-// ─────────────────────────────────────────────
-
-class ScanMessage {
+class _ScanMsg {
   final List<Map<String, dynamic>> files;
   final String step;
   final int progress;
   final bool done;
-  ScanMessage({required this.files, required this.step,
-      required this.progress, required this.done});
+  const _ScanMsg(this.files, this.step, this.progress, this.done);
 }
 
 Future<void> _scanIsolate(SendPort port) async {
-  final scanPaths = [
+  const roots = [
     '/storage/emulated/0/DCIM',
     '/storage/emulated/0/DCIM/Camera',
     '/storage/emulated/0/Pictures',
@@ -140,113 +183,125 @@ Future<void> _scanIsolate(SendPort port) async {
     '/storage/emulated/0/WhatsApp/Media/WhatsApp Documents',
     '/storage/emulated/0/Telegram',
     '/storage/emulated/0/Android/media',
-    '/storage/emulated/0/.thumbnails',
-    '/storage/emulated/0/DCIM/.thumbnails',
   ];
-
-  const imageExts = {'jpg','jpeg','png','gif','bmp','webp','heic','heif'};
-  const videoExts = {'mp4','mkv','avi','mov','3gp','flv','wmv','ts','m4v'};
-  const audioExts = {'mp3','m4a','wav','ogg','flac','aac','wma','opus'};
-  const docExts   = {'pdf','doc','docx','txt','xlsx','xls','pptx','ppt','csv'};
+  const img = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'heic', 'heif'};
+  const vid = {'mp4', 'mkv', 'avi', 'mov', '3gp', 'flv', 'wmv', 'ts', 'm4v', 'webm'};
+  const aud = {'mp3', 'm4a', 'wav', 'ogg', 'flac', 'aac', 'wma', 'opus'};
+  const doc = {'pdf', 'doc', 'docx', 'txt', 'xlsx', 'xls', 'pptx', 'ppt', 'csv'};
 
   final found = <Map<String, dynamic>>[];
-  int total = scanPaths.length;
   int done = 0;
 
-  for (final scanPath in scanPaths) {
+  for (final root in roots) {
     done++;
-    final dir = Directory(scanPath);
+    final dir = Directory(root);
+    port.send(_ScanMsg(
+      const [],
+      'Scanning ${root.split('/').last}…',
+      (done * 80 ~/ roots.length),
+      false,
+    ));
     if (!dir.existsSync()) {
-      port.send(ScanMessage(
-        files: [], step: 'Checking $scanPath...',
-        progress: (done * 80 ~/ total), done: false));
       continue;
     }
-
-    port.send(ScanMessage(
-      files: [], step: 'Scanning ${scanPath.split('/').last}...',
-      progress: (done * 80 ~/ total), done: false));
-
     try {
-      final entities = dir.listSync(recursive: true, followLinks: false);
-      for (final entity in entities) {
-        if (entity is! File) continue;
+      for (final e in dir.listSync(recursive: true, followLinks: false)) {
+        if (e is! File) {
+          continue;
+        }
         try {
-          final ext = entity.path.split('.').last.toLowerCase();
-          String? typeStr;
+          final ext = e.path.split('.').last.toLowerCase();
+          String? t;
           int conf = 75;
-          if (imageExts.contains(ext)) { typeStr = 'image';    conf = 90; }
-          else if (videoExts.contains(ext)) { typeStr = 'video'; conf = 88; }
-          else if (audioExts.contains(ext)) { typeStr = 'audio'; conf = 85; }
-          else if (docExts.contains(ext))   { typeStr = 'document'; conf = 80; }
-
-          if (typeStr == null) continue;
-          final stat = entity.statSync();
-          if (stat.size <= 0) continue;
-
+          if (img.contains(ext)) {
+            t = 'image';
+            conf = 90;
+          } else if (vid.contains(ext)) {
+            t = 'video';
+            conf = 88;
+          } else if (aud.contains(ext)) {
+            t = 'audio';
+            conf = 85;
+          } else if (doc.contains(ext)) {
+            t = 'document';
+            conf = 80;
+          }
+          if (t == null) {
+            continue;
+          }
+          final st = e.statSync();
+          if (st.size <= 0) {
+            continue;
+          }
           found.add({
-            'name': entity.path.split('/').last,
-            'path': entity.path,
-            'type': typeStr,
-            'size': stat.size,
-            'confidence': conf,
-            'modified': stat.modified.millisecondsSinceEpoch,
+            'n': e.path.split('/').last,
+            'p': e.path,
+            't': t,
+            's': st.size,
+            'c': conf,
+            'm': st.modified.millisecondsSinceEpoch,
           });
-
-          if (found.length % 50 == 0) {
-            port.send(ScanMessage(
-              files: List.from(found),
-              step: 'Found ${found.length} files...',
-              progress: (done * 80 ~/ total),
-              done: false,
+          if (found.length % 40 == 0) {
+            port.send(_ScanMsg(
+              List.from(found),
+              'Found ${found.length} files…',
+              (done * 80 ~/ roots.length),
+              false,
             ));
           }
         } catch (_) {}
       }
     } catch (_) {}
   }
-
-  port.send(ScanMessage(
-    files: found,
-    step: 'Scan complete! Found ${found.length} files',
-    progress: 100,
-    done: true,
-  ));
+  port.send(_ScanMsg(found, 'Done! ${found.length} files found', 100, true));
 }
 
-RFile _mapToRFile(Map<String, dynamic> m) {
-  FileType type;
-  switch (m['type']) {
-    case 'image': type = FileType.image; break;
-    case 'video': type = FileType.video; break;
-    case 'audio': type = FileType.audio; break;
-    case 'document': type = FileType.document; break;
-    default: type = FileType.other;
+RFile _fromMap(Map<String, dynamic> m) {
+  FileType t;
+  switch (m['t']) {
+    case 'image':
+      t = FileType.image;
+      break;
+    case 'video':
+      t = FileType.video;
+      break;
+    case 'audio':
+      t = FileType.audio;
+      break;
+    case 'document':
+      t = FileType.document;
+      break;
+    default:
+      t = FileType.other;
   }
   return RFile(
-    name: m['name'] as String,
-    path: m['path'] as String,
-    type: type,
-    size: m['size'] as int,
-    confidence: m['confidence'] as int,
-    modifiedDate: m['modified'] != null
-        ? DateTime.fromMillisecondsSinceEpoch(m['modified'] as int)
+    name: m['n'] as String,
+    path: m['p'] as String,
+    type: t,
+    size: m['s'] as int,
+    confidence: m['c'] as int,
+    modifiedDate: m['m'] != null
+        ? DateTime.fromMillisecondsSinceEpoch(m['m'] as int)
         : null,
   );
 }
 
-// ─────────────────────────────────────────────
-//  Permission Channel
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  PERMISSION CHANNEL
+// ══════════════════════════════════════════════════════
 
 const _ch = MethodChannel('com.example.recovery_app/permissions');
 
-// ─────────────────────────────────────────────
-//  Main
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  MAIN
+// ══════════════════════════════════════════════════════
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+  ]);
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
@@ -269,15 +324,26 @@ class RecoveryApp extends StatelessWidget {
           primary: Color(0xFF00E5FF),
           surface: Color(0xFF0D1321),
         ),
+        scrollbarTheme: ScrollbarThemeData(
+          thumbColor: WidgetStateProperty.all(
+            const Color(0xFF00E5FF).withValues(alpha: 0.6),
+          ),
+          trackColor: WidgetStateProperty.all(const Color(0xFF1A2740)),
+          thickness: WidgetStateProperty.all(6),
+          radius: const Radius.circular(4),
+          thumbVisibility: WidgetStateProperty.all(true),
+          trackVisibility: WidgetStateProperty.all(true),
+          interactive: true,
+        ),
       ),
       home: const PermissionScreen(),
     );
   }
 }
 
-// ─────────────────────────────────────────────
-//  Permission Screen
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  PERMISSION SCREEN
+// ══════════════════════════════════════════════════════
 
 class PermissionScreen extends StatefulWidget {
   const PermissionScreen({super.key});
@@ -290,27 +356,53 @@ class _PermissionScreenState extends State<PermissionScreen> {
   String _msg = '';
 
   @override
-  void initState() { super.initState(); _check(); }
+  void initState() {
+    super.initState();
+    _check();
+  }
 
   Future<void> _check() async {
     try {
       final ok = await _ch.invokeMethod<bool>('checkStoragePermission') ?? false;
-      if (ok && mounted) { _go(); return; }
+      if (ok && mounted) {
+        _go();
+        return;
+      }
     } catch (_) {}
-    if (mounted) setState(() { _loading = false; _msg = 'Allow storage access to scan deleted files'; });
+    if (mounted) {
+      setState(() {
+        _loading = false;
+        _msg = 'Allow storage access to scan deleted files';
+      });
+    }
   }
 
   Future<void> _request() async {
-    setState(() { _loading = true; _msg = 'Requesting...'; });
+    setState(() {
+      _loading = true;
+      _msg = 'Requesting…';
+    });
     try {
       final ok = await _ch.invokeMethod<bool>('requestStoragePermission') ?? false;
-      if (ok && mounted) { _go(); return; }
-      setState(() { _loading = false; _msg = 'Denied. Please allow from Settings.'; });
-    } catch (_) { _go(); }
+      if (ok && mounted) {
+        _go();
+        return;
+      }
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _msg = 'Permission denied. Please allow in Settings.';
+        });
+      }
+    } catch (_) {
+      _go();
+    }
   }
 
   void _go() => Navigator.pushReplacement(
-      context, MaterialPageRoute(builder: (_) => const HomeScreen()));
+        context,
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -320,72 +412,116 @@ class _PermissionScreenState extends State<PermissionScreen> {
         child: Center(
           child: Padding(
             padding: const EdgeInsets.all(32),
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              Container(
-                width: 110, height: 110,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: const Color(0xFF00E5FF).withA(0.08),
-                  border: Border.all(color: const Color(0xFF00E5FF).withA(0.4), width: 2),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 110,
+                  height: 110,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0xFF00E5FF).withA(0.08),
+                    border: Border.all(
+                      color: const Color(0xFF00E5FF).withA(0.4),
+                      width: 2,
+                    ),
+                  ),
+                  child: const Icon(
+                    Icons.security_rounded,
+                    color: Color(0xFF00E5FF),
+                    size: 52,
+                  ),
                 ),
-                child: const Icon(Icons.security_rounded, color: Color(0xFF00E5FF), size: 52),
-              ),
-              const SizedBox(height: 32),
-              const Text('DEEP RECOVER', style: TextStyle(
-                color: Color(0xFF00E5FF), fontSize: 24,
-                fontWeight: FontWeight.bold, letterSpacing: 3,
-              )),
-              const SizedBox(height: 8),
-              const Text('Android File Recovery', style: TextStyle(
-                color: Color(0xFF4A6FA5), fontSize: 13, letterSpacing: 1,
-              )),
-              const SizedBox(height: 32),
-              Text(_msg, textAlign: TextAlign.center,
-                  style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 13, height: 1.5)),
-              const SizedBox(height: 40),
-              if (_loading)
-                const CircularProgressIndicator(color: Color(0xFF00E5FF))
-              else ...[
-                _btn('GRANT PERMISSION', Icons.folder_open, _request, const Color(0xFF00E5FF)),
-                const SizedBox(height: 16),
-                TextButton(
-                  onPressed: _go,
-                  child: const Text('Skip (limited scan)',
-                      style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 12)),
+                const SizedBox(height: 32),
+                const Text(
+                  'DEEP RECOVER',
+                  style: TextStyle(
+                    color: Color(0xFF00E5FF),
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 3,
+                  ),
                 ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Android File Recovery',
+                  style: TextStyle(
+                    color: Color(0xFF4A6FA5),
+                    fontSize: 13,
+                    letterSpacing: 1,
+                  ),
+                ),
+                const SizedBox(height: 32),
+                Text(
+                  _msg,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Color(0xFF4A6FA5),
+                    fontSize: 13,
+                    height: 1.5,
+                  ),
+                ),
+                const SizedBox(height: 40),
+                if (_loading)
+                  const CircularProgressIndicator(color: Color(0xFF00E5FF))
+                else ...[
+                  GestureDetector(
+                    onTap: _request,
+                    child: Container(
+                      width: double.infinity,
+                      height: 56,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(16),
+                        gradient: const LinearGradient(
+                          colors: [Color(0xFF00B8D4), Color(0xFF00E5FF)],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFF00E5FF).withA(0.3),
+                            blurRadius: 20,
+                            offset: const Offset(0, 8),
+                          ),
+                        ],
+                      ),
+                      child: const Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.folder_open, color: Colors.black, size: 20),
+                          SizedBox(width: 10),
+                          Text(
+                            'GRANT PERMISSION',
+                            style: TextStyle(
+                              color: Colors.black,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                              letterSpacing: 1.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  TextButton(
+                    onPressed: _go,
+                    child: const Text(
+                      'Skip (limited scan)',
+                      style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 12),
+                    ),
+                  ),
+                ],
               ],
-            ]),
+            ),
           ),
         ),
       ),
     );
   }
-
-  Widget _btn(String label, IconData icon, VoidCallback fn, Color color) {
-    return GestureDetector(
-      onTap: fn,
-      child: Container(
-        width: double.infinity, height: 56,
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
-          gradient: LinearGradient(colors: [color.withA(0.8), color]),
-          boxShadow: [BoxShadow(color: color.withA(0.3), blurRadius: 20, offset: const Offset(0, 8))],
-        ),
-        child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Icon(icon, color: Colors.black, size: 20),
-          const SizedBox(width: 10),
-          Text(label, style: const TextStyle(
-            color: Colors.black, fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 1.5,
-          )),
-        ]),
-      ),
-    );
-  }
 }
 
-// ─────────────────────────────────────────────
-//  Home Screen
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  HOME SCREEN
+// ══════════════════════════════════════════════════════
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -402,17 +538,28 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    _pulse = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat(reverse: true);
-    _glow  = AnimationController(vsync: this, duration: const Duration(milliseconds: 1500))..repeat(reverse: true);
-    _pulseA = Tween<double>(begin: 0.95, end: 1.05).animate(CurvedAnimation(parent: _pulse, curve: Curves.easeInOut));
-    _glowA  = Tween<double>(begin: 0.3, end: 1.0).animate(CurvedAnimation(parent: _glow, curve: Curves.easeInOut));
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat(reverse: true);
+    _glow = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    )..repeat(reverse: true);
+    _pulseA = Tween<double>(begin: 0.95, end: 1.05).animate(
+      CurvedAnimation(parent: _pulse, curve: Curves.easeInOut),
+    );
+    _glowA = Tween<double>(begin: 0.3, end: 1.0).animate(
+      CurvedAnimation(parent: _glow, curve: Curves.easeInOut),
+    );
   }
 
   @override
-  void dispose() { _pulse.dispose(); _glow.dispose(); super.dispose(); }
-
-  void _startScan() => Navigator.push(
-      context, MaterialPageRoute(builder: (_) => const ScanScreen()));
+  void dispose() {
+    _pulse.dispose();
+    _glow.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -420,132 +567,203 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       body: Container(
         decoration: const BoxDecoration(
           gradient: RadialGradient(
-            center: Alignment(0, -0.3), radius: 1.2,
+            center: Alignment(0, -0.3),
+            radius: 1.2,
             colors: [Color(0xFF0D1F3C), Color(0xFF080C14)],
           ),
         ),
         child: SafeArea(
-          child: Column(children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
-              child: Row(children: [
-                Container(
-                  width: 38, height: 38,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF00E5FF).withA(0.12),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: const Color(0xFF00E5FF).withA(0.3)),
-                  ),
-                  child: const Icon(Icons.radar, color: Color(0xFF00E5FF), size: 20),
+          child: Column(
+            children: [
+              // Header
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 38,
+                      height: 38,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF00E5FF).withA(0.12),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0xFF00E5FF).withA(0.3)),
+                      ),
+                      child: const Icon(Icons.radar, color: Color(0xFF00E5FF), size: 20),
+                    ),
+                    const SizedBox(width: 12),
+                    const Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'DEEP RECOVER',
+                          style: TextStyle(
+                            color: Color(0xFF00E5FF),
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 3,
+                          ),
+                        ),
+                        Text(
+                          'Android File Recovery Engine',
+                          style: TextStyle(
+                            color: Color(0xFF4A6FA5),
+                            fontSize: 10,
+                            letterSpacing: 1,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 12),
-                const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text('DEEP RECOVER', style: TextStyle(
-                    color: Color(0xFF00E5FF), fontSize: 16,
-                    fontWeight: FontWeight.bold, letterSpacing: 3,
-                  )),
-                  Text('Android File Recovery Engine', style: TextStyle(
-                    color: Color(0xFF4A6FA5), fontSize: 10, letterSpacing: 1,
-                  )),
-                ]),
-              ]),
-            ),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: Column(children: [
-                  const SizedBox(height: 30),
-                  AnimatedBuilder(
-                    animation: Listenable.merge([_pulseA, _glowA]),
-                    builder: (_, a) => Transform.scale(
-                      scale: _pulseA.value,
-                      child: SizedBox(
-                        width: 220, height: 220,
-                        child: Stack(alignment: Alignment.center, children: [
-                          for (int i = 0; i < 4; i++)
-                            Container(
-                              width: 50.0 + i * 50, height: 50.0 + i * 50,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: const Color(0xFF00E5FF).withA((0.05 + i * 0.04) * _glowA.value),
-                                  width: 1,
+              ),
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  child: Column(
+                    children: [
+                      const SizedBox(height: 30),
+                      GestureDetector(
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => const ScanScreen()),
+                        ),
+                        child: AnimatedBuilder(
+                          animation: Listenable.merge([_pulseA, _glowA]),
+                          builder: (_, _) => Transform.scale(
+                            scale: _pulseA.value,
+                            child: SizedBox(
+                              width: 220,
+                              height: 220,
+                              child: Stack(
+                                alignment: Alignment.center,
+                                children: [
+                                  for (int i = 0; i < 4; i++)
+                                    Container(
+                                      width: 50.0 + i * 50,
+                                      height: 50.0 + i * 50,
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        border: Border.all(
+                                          color: const Color(0xFF00E5FF).withA(
+                                            (0.05 + i * 0.04) * _glowA.value,
+                                          ),
+                                          width: 1,
+                                        ),
+                                      ),
+                                    ),
+                                  Container(
+                                    width: 110,
+                                    height: 110,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      gradient: RadialGradient(
+                                        colors: [
+                                          const Color(0xFF00E5FF).withA(0.25),
+                                          const Color(0xFF0D3B5E).withA(0.9),
+                                        ],
+                                      ),
+                                      border: Border.all(
+                                        color: const Color(0xFF00E5FF)
+                                            .withA(0.5 * _glowA.value),
+                                        width: 1.5,
+                                      ),
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: const Color(0xFF00E5FF)
+                                              .withA(0.25 * _glowA.value),
+                                          blurRadius: 30,
+                                          spreadRadius: 8,
+                                        ),
+                                      ],
+                                    ),
+                                    child: const Icon(
+                                      Icons.manage_search_rounded,
+                                      color: Color(0xFF00E5FF),
+                                      size: 48,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Tap to start scanning',
+                        style: TextStyle(
+                          color: Color(0xFF4A6FA5),
+                          fontSize: 12,
+                          letterSpacing: 1,
+                        ),
+                      ),
+                      const SizedBox(height: 32),
+                      Row(
+                        children: [
+                          _card(Icons.image_rounded, 'Photos', 'JPG PNG HEIC', const Color(0xFF00E5FF)),
+                          const SizedBox(width: 10),
+                          _card(Icons.videocam_rounded, 'Videos', 'MP4 MKV AVI', const Color(0xFFFF4081)),
+                          const SizedBox(width: 10),
+                          _card(Icons.audiotrack_rounded, 'Audio', 'MP3 WAV AAC', const Color(0xFFFFD740)),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          _card(Icons.description_rounded, 'Docs', 'PDF DOCX TXT', const Color(0xFF69FF47)),
+                          const SizedBox(width: 10),
+                          _card(Icons.chat_rounded, 'WhatsApp', 'Media files', const Color(0xFF25D366)),
+                          const SizedBox(width: 10),
+                          _card(Icons.send, 'Telegram', 'Media files', const Color(0xFF2AABEE)),
+                        ],
+                      ),
+                      const SizedBox(height: 32),
+                      GestureDetector(
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => const ScanScreen()),
+                        ),
+                        child: Container(
+                          width: double.infinity,
+                          height: 60,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(18),
+                            gradient: const LinearGradient(
+                              colors: [Color(0xFF00B8D4), Color(0xFF00E5FF)],
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: const Color(0xFF00E5FF).withA(0.4),
+                                blurRadius: 24,
+                                offset: const Offset(0, 10),
+                              ),
+                            ],
+                          ),
+                          child: const Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.radar, color: Colors.black, size: 24),
+                              SizedBox(width: 12),
+                              Text(
+                                'START DEEP SCAN',
+                                style: TextStyle(
+                                  color: Colors.black,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 15,
+                                  letterSpacing: 2,
                                 ),
                               ),
-                            ),
-                          Container(
-                            width: 110, height: 110,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              gradient: RadialGradient(colors: [
-                                const Color(0xFF00E5FF).withA(0.25),
-                                const Color(0xFF0D3B5E).withA(0.9),
-                              ]),
-                              border: Border.all(
-                                color: const Color(0xFF00E5FF).withA(0.5 * _glowA.value),
-                                width: 1.5,
-                              ),
-                              boxShadow: [BoxShadow(
-                                color: const Color(0xFF00E5FF).withA(0.25 * _glowA.value),
-                                blurRadius: 30, spreadRadius: 8,
-                              )],
-                            ),
-                            child: const Icon(Icons.manage_search_rounded,
-                                color: Color(0xFF00E5FF), size: 48),
+                            ],
                           ),
-                        ]),
+                        ),
                       ),
-                    ),
+                      const SizedBox(height: 20),
+                    ],
                   ),
-                  const SizedBox(height: 12),
-                  const Text('Tap to start scanning', style: TextStyle(
-                    color: Color(0xFF4A6FA5), fontSize: 12, letterSpacing: 1,
-                  )),
-                  const SizedBox(height: 32),
-                  Row(children: [
-                    _card(Icons.image_rounded,    'Photos',   'JPG PNG HEIC', const Color(0xFF00E5FF)),
-                    const SizedBox(width: 10),
-                    _card(Icons.videocam_rounded, 'Videos',   'MP4 MKV AVI',  const Color(0xFFFF4081)),
-                    const SizedBox(width: 10),
-                    _card(Icons.audiotrack_rounded,'Audio',   'MP3 WAV AAC',  const Color(0xFFFFD740)),
-                  ]),
-                  const SizedBox(height: 10),
-                  Row(children: [
-                    _card(Icons.description_rounded,'Docs',   'PDF DOCX TXT', const Color(0xFF69FF47)),
-                    const SizedBox(width: 10),
-                    _card(Icons.chat_rounded,     'WhatsApp', 'Media files',  const Color(0xFF25D366)),
-                    const SizedBox(width: 10),
-                    _card(Icons.send,             'Telegram', 'Media files',  const Color(0xFF2AABEE)),
-                  ]),
-                  const SizedBox(height: 32),
-                  GestureDetector(
-                    onTap: _startScan,
-                    child: Container(
-                      width: double.infinity, height: 60,
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(18),
-                        gradient: const LinearGradient(
-                            colors: [Color(0xFF00B8D4), Color(0xFF00E5FF)]),
-                        boxShadow: [BoxShadow(
-                          color: const Color(0xFF00E5FF).withA(0.4),
-                          blurRadius: 24, offset: const Offset(0, 10),
-                        )],
-                      ),
-                      child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                        Icon(Icons.radar, color: Colors.black, size: 24),
-                        SizedBox(width: 12),
-                        Text('START DEEP SCAN', style: TextStyle(
-                          color: Colors.black, fontWeight: FontWeight.bold,
-                          fontSize: 15, letterSpacing: 2,
-                        )),
-                      ]),
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                ]),
+                ),
               ),
-            ),
-          ]),
+            ],
+          ),
         ),
       ),
     );
@@ -560,23 +778,34 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           borderRadius: BorderRadius.circular(14),
           border: Border.all(color: const Color(0xFF1A2740)),
         ),
-        child: Column(children: [
-          Icon(icon, color: color, size: 22),
-          const SizedBox(height: 6),
-          Text(title, style: const TextStyle(
-              color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11)),
-          const SizedBox(height: 2),
-          Text(sub, textAlign: TextAlign.center,
-              style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 9)),
-        ]),
+        child: Column(
+          children: [
+            Icon(icon, color: color, size: 22),
+            const SizedBox(height: 6),
+            Text(
+              title,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+                fontSize: 11,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              sub,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 9),
+            ),
+          ],
+        ),
       ),
     );
   }
 }
 
-// ─────────────────────────────────────────────
-//  Scan Screen
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  SCAN SCREEN
+// ══════════════════════════════════════════════════════
 
 class ScanScreen extends StatefulWidget {
   const ScanScreen({super.key});
@@ -586,10 +815,8 @@ class ScanScreen extends StatefulWidget {
 
 class _ScanScreenState extends State<ScanScreen> with TickerProviderStateMixin {
   late AnimationController _radar;
-  late Animation<double> _radarA;
-
   double _progress = 0;
-  String _step = 'Starting scan...';
+  String _step = 'Starting scan…';
   List<RFile> _files = [];
   bool _done = false;
   Isolate? _iso;
@@ -598,34 +825,48 @@ class _ScanScreenState extends State<ScanScreen> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    _radar = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat();
-    _radarA = Tween<double>(begin: 0, end: 1).animate(_radar);
+    _radar = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat();
     _startScan();
   }
 
   Future<void> _startScan() async {
     _port = ReceivePort();
-    _iso = await Isolate.spawn(_scanIsolate, _port!.sendPort);
-
-    _port!.listen((msg) {
-      if (msg is ScanMessage) {
-        if (!mounted) return;
+    try {
+      _iso = await Isolate.spawn(_scanIsolate, _port!.sendPort);
+    } catch (e) {
+      if (mounted) {
         setState(() {
-          if (msg.files.isNotEmpty) {
-            _files = msg.files.map(_mapToRFile).toList();
-          }
-          _step = msg.step;
-          _progress = msg.progress / 100.0;
-          _done = msg.done;
+          _step = 'Scan error: $e';
         });
-        if (msg.done) {
-          Future.delayed(const Duration(milliseconds: 600), () {
-            if (mounted) {
-              Navigator.pushReplacement(context,
-                  MaterialPageRoute(builder: (_) => ResultScreen(files: _files)));
-            }
-          });
+      }
+      return;
+    }
+    _port!.listen((msg) {
+      if (msg is! _ScanMsg || !mounted) {
+        return;
+      }
+      setState(() {
+        if (msg.files.isNotEmpty) {
+          _files = msg.files.map(_fromMap).toList();
         }
+        _step = msg.step;
+        _progress = msg.progress / 100.0;
+        _done = msg.done;
+      });
+      if (msg.done) {
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (mounted) {
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (_) => ResultScreen(files: List.from(_files)),
+              ),
+            );
+          }
+        });
       }
     });
   }
@@ -645,98 +886,132 @@ class _ScanScreenState extends State<ScanScreen> with TickerProviderStateMixin {
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(24),
-          child: Column(children: [
-            Row(children: [
-              GestureDetector(
-                onTap: () { Navigator.pop(context); },
-                child: const Icon(Icons.arrow_back_ios_new,
-                    color: Color(0xFF4A6FA5), size: 20),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  GestureDetector(
+                    onTap: () {
+                      _iso?.kill();
+                      Navigator.pop(context);
+                    },
+                    child: const Icon(
+                      Icons.arrow_back_ios_new,
+                      color: Color(0xFF4A6FA5),
+                      size: 20,
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Text(
+                    _done ? 'COMPLETE' : 'SCANNING…',
+                    style: const TextStyle(
+                      color: Color(0xFF00E5FF),
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 3,
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 16),
-              Text(_done ? 'COMPLETE' : 'SCANNING...',
-                  style: const TextStyle(
-                    color: Color(0xFF00E5FF), fontSize: 14,
-                    fontWeight: FontWeight.bold, letterSpacing: 3,
-                  )),
-            ]),
-            const SizedBox(height: 40),
-            AnimatedBuilder(
-              animation: _radarA,
-              builder: (_, a) => SizedBox(
-                width: 200, height: 200,
-                child: Stack(alignment: Alignment.center, children: [
-                  for (int i = 0; i < 3; i++)
-                    Container(
-                      width: 60.0 + i * 50, height: 60.0 + i * 50,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: const Color(0xFF00E5FF).withA(0.1 + i * 0.05),
-                          width: 1,
+              const SizedBox(height: 40),
+              RotationTransition(
+                turns: _radar,
+                child: SizedBox(
+                  width: 180,
+                  height: 180,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      for (int i = 0; i < 3; i++)
+                        Container(
+                          width: 60.0 + i * 50,
+                          height: 60.0 + i * 50,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: const Color(0xFF00E5FF).withA(0.12 + i * 0.06),
+                              width: 1,
+                            ),
+                          ),
+                        ),
+                      Container(
+                        width: 80,
+                        height: 2,
+                        decoration: const BoxDecoration(
+                          gradient: LinearGradient(
+                            colors: [Colors.transparent, Color(0xFF00E5FF)],
+                          ),
                         ),
                       ),
-                    ),
-                  Transform.rotate(
-                    angle: _radarA.value * 2 * 3.14159,
-                    child: Container(
-                      width: 80, height: 2,
-                      decoration: const BoxDecoration(
-                        gradient: LinearGradient(
-                            colors: [Colors.transparent, Color(0xFF00E5FF)]),
+                      Container(
+                        width: 10,
+                        height: 10,
+                        decoration: const BoxDecoration(
+                          color: Color(0xFF00E5FF),
+                          shape: BoxShape.circle,
+                        ),
                       ),
-                    ),
+                    ],
                   ),
-                  Container(
-                    width: 12, height: 12,
-                    decoration: const BoxDecoration(
-                        color: Color(0xFF00E5FF), shape: BoxShape.circle),
-                  ),
-                ]),
-              ),
-            ),
-            const SizedBox(height: 32),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: LinearProgressIndicator(
-                value: _progress,
-                backgroundColor: const Color(0xFF1A2740),
-                valueColor: const AlwaysStoppedAnimation(Color(0xFF00E5FF)),
-                minHeight: 8,
-              ),
-            ),
-            const SizedBox(height: 16),
-            Text(_step, textAlign: TextAlign.center,
-                style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 12)),
-            const SizedBox(height: 8),
-            Text('${(_progress * 100).toInt()}%', style: const TextStyle(
-              color: Color(0xFF00E5FF), fontSize: 40, fontWeight: FontWeight.bold,
-            )),
-            const Spacer(),
-            if (_files.isNotEmpty)
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF69FF47).withA(0.08),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: const Color(0xFF69FF47).withA(0.3)),
                 ),
-                child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                  const Icon(Icons.check_circle, color: Color(0xFF69FF47), size: 18),
-                  const SizedBox(width: 8),
-                  Text('Found ${_files.length} files so far...',
-                      style: const TextStyle(color: Color(0xFF69FF47), fontSize: 13)),
-                ]),
               ),
-          ]),
+              const SizedBox(height: 32),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: LinearProgressIndicator(
+                  value: _progress,
+                  backgroundColor: const Color(0xFF1A2740),
+                  valueColor: const AlwaysStoppedAnimation(Color(0xFF00E5FF)),
+                  minHeight: 8,
+                ),
+              ),
+              const SizedBox(height: 14),
+              Text(
+                _step,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 12),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '${(_progress * 100).toInt()}%',
+                style: const TextStyle(
+                  color: Color(0xFF00E5FF),
+                  fontSize: 40,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Spacer(),
+              if (_files.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF69FF47).withA(0.08),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFF69FF47).withA(0.3)),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.check_circle, color: Color(0xFF69FF47), size: 18),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Found ${_files.length} files…',
+                        style: const TextStyle(color: Color(0xFF69FF47), fontSize: 13),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
     );
   }
 }
 
-// ─────────────────────────────────────────────
-//  Result Screen — Gallery + List view
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  RESULT SCREEN
+// ══════════════════════════════════════════════════════
 
 class ResultScreen extends StatefulWidget {
   final List<RFile> files;
@@ -745,22 +1020,186 @@ class ResultScreen extends StatefulWidget {
   State<ResultScreen> createState() => _ResultScreenState();
 }
 
-class _ResultScreenState extends State<ResultScreen>
-    with SingleTickerProviderStateMixin {
+class _ResultScreenState extends State<ResultScreen> {
   FileType? _filter;
-  bool _galleryMode = true;
-  final ScrollController _scrollController = ScrollController();
+  bool _gallery = true;
+  SortBy _sortBy = SortBy.date;
+  bool _sortAsc = false;
+  String _search = '';
+  final _scrollCtrl = ScrollController();
+  final _searchCtrl = TextEditingController();
+  bool _showSearch = false;
 
-  List<RFile> get _filtered => _filter == null
-      ? widget.files
-      : widget.files.where((f) => f.type == _filter).toList();
+  List<RFile> get _shown {
+    var list = _filter == null
+        ? widget.files
+        : widget.files.where((f) => f.type == _filter).toList();
 
-  int get _selectedCount => widget.files.where((f) => f.selected).length;
+    if (_search.isNotEmpty) {
+      list = list
+          .where((f) => f.name.toLowerCase().contains(_search.toLowerCase()))
+          .toList();
+    }
+
+    list.sort((a, b) {
+      int cmp;
+      switch (_sortBy) {
+        case SortBy.date:
+          cmp = (a.modifiedDate ?? DateTime(0))
+              .compareTo(b.modifiedDate ?? DateTime(0));
+          break;
+        case SortBy.name:
+          cmp = a.name.toLowerCase().compareTo(b.name.toLowerCase());
+          break;
+        case SortBy.size:
+          cmp = a.size.compareTo(b.size);
+          break;
+        case SortBy.type:
+          cmp = a.type.index.compareTo(b.type.index);
+          break;
+      }
+      return _sortAsc ? cmp : -cmp;
+    });
+    return list;
+  }
+
+  int get _selCount => widget.files.where((f) => f.selected).length;
 
   @override
   void dispose() {
-    _scrollController.dispose();
+    _scrollCtrl.dispose();
+    _searchCtrl.dispose();
     super.dispose();
+  }
+
+  void _deleteSelected() async {
+    final sel = widget.files.where((f) => f.selected).toList();
+    if (sel.isEmpty) {
+      return;
+    }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => _ConfirmDialog(
+        title: 'Delete ${sel.length} file${sel.length > 1 ? 's' : ''}?',
+        body: 'This will permanently delete the selected files from your device.',
+        confirm: 'DELETE',
+        confirmColor: const Color(0xFFFF4081),
+      ),
+    );
+    if (ok != true) {
+      return;
+    }
+    int deleted = 0;
+    for (final f in sel) {
+      try {
+        File(f.path).deleteSync();
+        deleted++;
+      } catch (_) {}
+    }
+    setState(() => widget.files.removeWhere((f) => f.selected));
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Deleted $deleted file${deleted != 1 ? 's' : ''}'),
+        backgroundColor: const Color(0xFFFF4081),
+      ));
+    }
+  }
+
+  void _showSortSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF0D1321),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setS) => Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Sort & Order',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 8,
+                children: SortBy.values.map((s) {
+                  final labels = {
+                    SortBy.date: 'Date',
+                    SortBy.name: 'Name',
+                    SortBy.size: 'Size',
+                    SortBy.type: 'Type',
+                  };
+                  final active = _sortBy == s;
+                  return GestureDetector(
+                    onTap: () {
+                      setS(() {});
+                      setState(() {
+                        if (_sortBy == s) {
+                          _sortAsc = !_sortAsc;
+                        } else {
+                          _sortBy = s;
+                        }
+                      });
+                    },
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 150),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: active
+                            ? const Color(0xFF00E5FF).withA(0.15)
+                            : const Color(0xFF1A2740),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: active
+                              ? const Color(0xFF00E5FF).withA(0.6)
+                              : Colors.transparent,
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            labels[s]!,
+                            style: TextStyle(
+                              color: active
+                                  ? const Color(0xFF00E5FF)
+                                  : const Color(0xFF4A6FA5),
+                              fontSize: 13,
+                              fontWeight: active
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                            ),
+                          ),
+                          if (active) ...[
+                            const SizedBox(width: 4),
+                            Icon(
+                              _sortAsc
+                                  ? Icons.arrow_upward
+                                  : Icons.arrow_downward,
+                              color: const Color(0xFF00E5FF),
+                              size: 14,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  );
+                }).toList(),
+              ),
+              const SizedBox(height: 16),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -768,59 +1207,155 @@ class _ResultScreenState extends State<ResultScreen>
     return Scaffold(
       backgroundColor: const Color(0xFF080C14),
       body: SafeArea(
-        child: Column(children: [
-          _buildHeader(),
-          _buildFilterBar(),
-          _buildViewToggle(),
-          _buildStats(),
-          Expanded(child: widget.files.isEmpty ? _empty() : _buildContent()),
-          if (_selectedCount > 0) _buildBottomBar(),
-        ]),
+        child: Column(
+          children: [
+            _header(),
+            if (_showSearch) _searchBar(),
+            _filterBar(),
+            _viewToggle(),
+            _stats(),
+            Expanded(child: widget.files.isEmpty ? _empty() : _content()),
+            if (_selCount > 0) _bottomBar(),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildHeader() {
+  Widget _header() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
-      child: Row(children: [
-        GestureDetector(
-          onTap: () => Navigator.pop(context),
-          child: const Icon(Icons.arrow_back_ios_new,
-              color: Color(0xFF4A6FA5), size: 20),
-        ),
-        const SizedBox(width: 16),
-        const Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('RECOVERY RESULTS', style: TextStyle(
-              color: Color(0xFF00E5FF), fontSize: 14,
-              fontWeight: FontWeight.bold, letterSpacing: 2,
-            )),
-            Text('Tap = Open  •  Long Press = Select',
-                style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 11)),
-          ]),
-        ),
-        GestureDetector(
-          onTap: () => setState(() {
-            final all = widget.files.every((f) => f.selected);
-            for (final f in widget.files) { f.selected = !all; }
-          }),
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-              color: const Color(0xFF0D1321),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: const Color(0xFF1A2740)),
+      padding: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+      child: Row(
+        children: [
+          GestureDetector(
+            onTap: () => Navigator.pop(context),
+            child: const Icon(
+              Icons.arrow_back_ios_new,
+              color: Color(0xFF4A6FA5),
+              size: 20,
             ),
-            child: const Text('ALL',
-                style: TextStyle(color: Color(0xFF00E5FF), fontSize: 11)),
           ),
-        ),
-      ]),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'RECOVERY RESULTS',
+                  style: TextStyle(
+                    color: Color(0xFF00E5FF),
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 2,
+                  ),
+                ),
+                Text(
+                  'Tap = Open   Long Press = Select',
+                  style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 10),
+                ),
+              ],
+            ),
+          ),
+          // Search toggle
+          GestureDetector(
+            onTap: () => setState(() {
+              _showSearch = !_showSearch;
+              if (!_showSearch) {
+                _search = '';
+                _searchCtrl.clear();
+              }
+            }),
+            child: Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: _showSearch
+                    ? const Color(0xFF00E5FF).withA(0.15)
+                    : const Color(0xFF0D1321),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: _showSearch
+                      ? const Color(0xFF00E5FF).withA(0.5)
+                      : const Color(0xFF1A2740),
+                ),
+              ),
+              child: Icon(
+                Icons.search,
+                color: _showSearch
+                    ? const Color(0xFF00E5FF)
+                    : const Color(0xFF4A6FA5),
+                size: 18,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          // Sort button
+          GestureDetector(
+            onTap: _showSortSheet,
+            child: Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0D1321),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF1A2740)),
+              ),
+              child: const Icon(Icons.sort, color: Color(0xFF4A6FA5), size: 18),
+            ),
+          ),
+          const SizedBox(width: 8),
+          // Select all
+          GestureDetector(
+            onTap: () => setState(() {
+              final all = widget.files.every((f) => f.selected);
+              for (final f in widget.files) {
+                f.selected = !all;
+              }
+            }),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0D1321),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF1A2740)),
+              ),
+              child: const Text(
+                'ALL',
+                style: TextStyle(color: Color(0xFF00E5FF), fontSize: 11),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
-  Widget _buildFilterBar() {
+  Widget _searchBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      child: Container(
+        height: 40,
+        decoration: BoxDecoration(
+          color: const Color(0xFF0D1321),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0xFF00E5FF).withA(0.3)),
+        ),
+        child: TextField(
+          controller: _searchCtrl,
+          autofocus: true,
+          style: const TextStyle(color: Colors.white, fontSize: 13),
+          decoration: const InputDecoration(
+            hintText: 'Search files…',
+            hintStyle: TextStyle(color: Color(0xFF4A6FA5), fontSize: 13),
+            prefixIcon: Icon(Icons.search, color: Color(0xFF4A6FA5), size: 18),
+            border: InputBorder.none,
+            contentPadding: EdgeInsets.symmetric(vertical: 10),
+          ),
+          onChanged: (v) => setState(() => _search = v),
+        ),
+      ),
+    );
+  }
+
+  Widget _filterBar() {
     return SizedBox(
       height: 44,
       child: ListView(
@@ -834,56 +1369,78 @@ class _ResultScreenState extends State<ResultScreen>
     );
   }
 
-  Widget _chip(FileType? type, String label, IconData icon) {
-    final sel = _filter == type;
-    final color = type?.color ?? const Color(0xFF00E5FF);
+  Widget _chip(FileType? t, String label, IconData icon) {
+    final sel = _filter == t;
+    final c = t?.color ?? const Color(0xFF00E5FF);
     return GestureDetector(
-      onTap: () => setState(() => _filter = type),
+      onTap: () => setState(() {
+        _filter = t;
+        _scrollCtrl.jumpTo(0);
+      }),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 150),
         margin: const EdgeInsets.only(right: 8),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
         decoration: BoxDecoration(
-          color: sel ? color.withA(0.15) : const Color(0xFF0D1321),
+          color: sel ? c.withA(0.15) : const Color(0xFF0D1321),
           borderRadius: BorderRadius.circular(20),
           border: Border.all(
-              color: sel ? color.withA(0.6) : const Color(0xFF1A2740)),
+            color: sel ? c.withA(0.6) : const Color(0xFF1A2740),
+          ),
         ),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          Icon(icon, color: sel ? color : const Color(0xFF4A6FA5), size: 13),
-          const SizedBox(width: 5),
-          Text(label, style: TextStyle(
-              color: sel ? color : const Color(0xFF4A6FA5),
-              fontSize: 11, fontWeight: FontWeight.w500)),
-        ]),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: sel ? c : const Color(0xFF4A6FA5), size: 13),
+            const SizedBox(width: 5),
+            Text(
+              label,
+              style: TextStyle(
+                color: sel ? c : const Color(0xFF4A6FA5),
+                fontSize: 11,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildViewToggle() {
+  Widget _viewToggle() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 10, 20, 0),
-      child: Row(children: [
-        const Spacer(),
-        Container(
-          decoration: BoxDecoration(
-            color: const Color(0xFF0D1321),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: const Color(0xFF1A2740)),
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+      child: Row(
+        children: [
+          // Sort label
+          Text(
+            '${_sortBy.name[0].toUpperCase()}${_sortBy.name.substring(1)} ${_sortAsc ? '↑' : '↓'}',
+            style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 11),
           ),
-          child: Row(mainAxisSize: MainAxisSize.min, children: [
-            _toggleBtn(Icons.grid_view_rounded, true),
-            _toggleBtn(Icons.list_rounded, false),
-          ]),
-        ),
-      ]),
+          const Spacer(),
+          Container(
+            decoration: BoxDecoration(
+              color: const Color(0xFF0D1321),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF1A2740)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _togBtn(Icons.grid_view_rounded, true),
+                _togBtn(Icons.list_rounded, false),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
-  Widget _toggleBtn(IconData icon, bool isGallery) {
-    final active = _galleryMode == isGallery;
+  Widget _togBtn(IconData icon, bool isGrid) {
+    final active = _gallery == isGrid;
     return GestureDetector(
-      onTap: () => setState(() => _galleryMode = isGallery),
+      onTap: () => setState(() => _gallery = isGrid),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 150),
         padding: const EdgeInsets.all(8),
@@ -891,338 +1448,408 @@ class _ResultScreenState extends State<ResultScreen>
           color: active ? const Color(0xFF00E5FF).withA(0.15) : Colors.transparent,
           borderRadius: BorderRadius.circular(8),
         ),
-        child: Icon(icon,
-            color: active ? const Color(0xFF00E5FF) : const Color(0xFF4A6FA5),
-            size: 18),
+        child: Icon(
+          icon,
+          color: active ? const Color(0xFF00E5FF) : const Color(0xFF4A6FA5),
+          size: 18,
+        ),
       ),
     );
   }
 
-  Widget _buildStats() {
+  Widget _stats() {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 10, 20, 6),
-      child: Row(children: [
-        _badge('${_filtered.length}', 'Files', const Color(0xFF00E5FF)),
-        const SizedBox(width: 12),
-        _badge('$_selectedCount', 'Selected', const Color(0xFF69FF47)),
-      ]),
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
+      child: Row(
+        children: [
+          _badge('${_shown.length}', 'Files', const Color(0xFF00E5FF)),
+          const SizedBox(width: 12),
+          _badge('$_selCount', 'Selected', const Color(0xFF69FF47)),
+        ],
+      ),
     );
   }
 
   Widget _badge(String v, String l, Color c) {
-    return Row(children: [
-      Text(v, style: TextStyle(color: c, fontSize: 18, fontWeight: FontWeight.bold)),
-      const SizedBox(width: 4),
-      Text(l, style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 11)),
-    ]);
+    return Row(
+      children: [
+        Text(v, style: TextStyle(color: c, fontSize: 18, fontWeight: FontWeight.bold)),
+        const SizedBox(width: 4),
+        Text(l, style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 11)),
+      ],
+    );
   }
 
   Widget _empty() {
     return const Center(
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Icon(Icons.search_off, color: Color(0xFF1A2740), size: 64),
-        SizedBox(height: 16),
-        Text('No files found', style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 16)),
-        SizedBox(height: 8),
-        Text('Grant storage permission and try again',
-            style: TextStyle(color: Color(0xFF2A3F5F), fontSize: 13)),
-      ]),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.search_off, color: Color(0xFF1A2740), size: 64),
+          SizedBox(height: 16),
+          Text('No files found', style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 16)),
+          SizedBox(height: 8),
+          Text(
+            'Grant storage permission and try again',
+            style: TextStyle(color: Color(0xFF2A3F5F), fontSize: 13),
+          ),
+        ],
+      ),
     );
   }
 
-  Widget _buildContent() {
-    if (_filtered.isEmpty) {
-      return const Center(child: Text('No files in this category',
-          style: TextStyle(color: Color(0xFF4A6FA5))));
+  Widget _content() {
+    final list = _shown;
+    if (list.isEmpty) {
+      return const Center(
+        child: Text('No files here', style: TextStyle(color: Color(0xFF4A6FA5))),
+      );
     }
-    return _galleryMode ? _buildGallery() : _buildList();
+    return _gallery ? _gridView(list) : _listView(list);
   }
 
-  // ── Gallery Grid — with scrollbar ──
-  Widget _buildGallery() {
+  // ── GRID ──
+  Widget _gridView(List<RFile> list) {
     return Scrollbar(
-      controller: _scrollController,
-      thumbVisibility: true,
-      thickness: 6,
-      radius: const Radius.circular(4),
+      controller: _scrollCtrl,
+      interactive: true,
       child: GridView.builder(
-        controller: _scrollController,
-        padding: const EdgeInsets.all(12),
+        controller: _scrollCtrl,
+        padding: const EdgeInsets.all(10),
+        cacheExtent: 800,
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
           crossAxisCount: 3,
           crossAxisSpacing: 4,
           mainAxisSpacing: 4,
-          childAspectRatio: 1,
         ),
-        itemCount: _filtered.length,
-        // cacheExtent helps pre-load nearby items off screen
-        cacheExtent: 600,
-        itemBuilder: (ctx, i) => _galleryItem(_filtered[i]),
+        itemCount: list.length,
+        itemBuilder: (_, i) => RepaintBoundary(child: _gridItem(list[i])),
       ),
     );
   }
 
-  Widget _galleryItem(RFile file) {
+  Widget _gridItem(RFile f) {
     return GestureDetector(
-      // Tap = open/preview
-      onTap: () => _preview(file),
-      // Long press = select/deselect
-      onLongPress: () => setState(() => file.selected = !file.selected),
-      child: Stack(fit: StackFit.expand, children: [
-        ClipRRect(
-          borderRadius: BorderRadius.circular(8),
-          child: _buildThumbnail(file),
-        ),
-        // Selection overlay
-        if (file.selected)
-          Container(
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
-              color: file.type.color.withA(0.5),
-              border: Border.all(color: file.type.color, width: 2),
-            ),
-            child: const Center(
-              child: Icon(Icons.check_circle, color: Colors.white, size: 28),
-            ),
-          ),
-        // Video play icon
-        if (file.isVideo && !file.selected)
-          const Center(
-            child: Icon(Icons.play_circle_fill,
-                color: Colors.white70, size: 32),
-          ),
-        // Type badge for non-image/video
-        if (!file.isImage && !file.isVideo)
-          Positioned(
-            top: 4, right: 4,
-            child: Container(
-              padding: const EdgeInsets.all(4),
-              decoration: BoxDecoration(
-                color: file.type.color.withA(0.9),
-                borderRadius: BorderRadius.circular(6),
-              ),
-              child: Icon(file.type.icon, color: Colors.black, size: 12),
-            ),
-          ),
-        // Date on hover (bottom)
-        if (file.modifiedDate != null)
-          Positioned(
-            bottom: 0, left: 0, right: 0,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-              decoration: BoxDecoration(
-                borderRadius: const BorderRadius.vertical(bottom: Radius.circular(8)),
-                gradient: LinearGradient(
-                  begin: Alignment.bottomCenter,
-                  end: Alignment.topCenter,
-                  colors: [Colors.black.withA(0.7), Colors.transparent],
-                ),
-              ),
-              child: Text(
-                DateFormat('dd/MM/yy').format(file.modifiedDate!),
-                style: const TextStyle(color: Colors.white70, fontSize: 7),
-                textAlign: TextAlign.center,
-              ),
-            ),
-          ),
-      ]),
-    );
-  }
-
-  // Optimized thumbnail builder — image loads fast, video uses async thumbnail
-  Widget _buildThumbnail(RFile file) {
-    if (file.isImage) {
-      return Image.file(
-        File(file.path),
-        fit: BoxFit.cover,
-        cacheWidth: 200,
-        errorBuilder: (_, e, s) => _thumbPlaceholder(file),
-      );
-    }
-    if (file.isVideo) {
-      return _VideoThumb(path: file.path, file: file);
-    }
-    return _thumbPlaceholder(file);
-  }
-
-  Widget _thumbPlaceholder(RFile file) {
-    return Container(
-      decoration: BoxDecoration(
-        color: file.type.color.withA(0.08),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: file.type.color.withA(0.2)),
-      ),
-      child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-        Icon(file.type.icon, color: file.type.color, size: 28),
-        const SizedBox(height: 4),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 4),
-          child: Text(file.name,
-            style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 8),
-            maxLines: 2, overflow: TextOverflow.ellipsis,
-            textAlign: TextAlign.center,
-          ),
-        ),
-      ]),
-    );
-  }
-
-  // ── List View ──
-  Widget _buildList() {
-    return Scrollbar(
-      controller: _scrollController,
-      thumbVisibility: true,
-      thickness: 6,
-      radius: const Radius.circular(4),
-      child: ListView.builder(
-        controller: _scrollController,
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        itemCount: _filtered.length,
-        itemBuilder: (ctx, i) => _listItem(_filtered[i]),
-      ),
-    );
-  }
-
-  Widget _listItem(RFile file) {
-    return GestureDetector(
-      onTap: () => _preview(file),
-      onLongPress: () => setState(() => file.selected = !file.selected),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 150),
-        margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
-          color: file.selected ? file.type.color.withA(0.08) : const Color(0xFF0D1321),
-          border: Border.all(
-            color: file.selected ? file.type.color.withA(0.4) : const Color(0xFF1A2740),
-          ),
-        ),
-        child: Row(children: [
+      onTap: () => _open(f),
+      onLongPress: () => setState(() => f.selected = !f.selected),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
           ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: SizedBox(
-              width: 56, height: 56,
-              child: _buildThumbnail(file),
-            ),
+            borderRadius: BorderRadius.circular(7),
+            child: _thumb(f),
           ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(file.name, style: const TextStyle(
-                  color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
-                  overflow: TextOverflow.ellipsis),
-              const SizedBox(height: 3),
-              if (file.modifiedDate != null)
-                Text(file.dateLabel,
-                    style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 10)),
-              const SizedBox(height: 3),
-              Row(children: [
-                Text(file.sizeLabel,
-                    style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 11)),
-                const SizedBox(width: 8),
-                SizedBox(
-                  width: 50, height: 3,
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(2),
-                    child: LinearProgressIndicator(
-                      value: file.confidence / 100,
-                      backgroundColor: const Color(0xFF1A2740),
-                      valueColor: AlwaysStoppedAnimation(file.type.color),
-                    ),
+          if (f.selected)
+            Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(7),
+                color: f.type.color.withA(0.45),
+                border: Border.all(color: f.type.color, width: 2),
+              ),
+              child: const Center(
+                child: Icon(Icons.check_circle, color: Colors.white, size: 26),
+              ),
+            ),
+          if (f.isVideo && !f.selected)
+            const Center(
+              child: Icon(Icons.play_circle_fill, color: Colors.white70, size: 30),
+            ),
+          if (!f.isImage && !f.isVideo)
+            Positioned(
+              top: 4,
+              right: 4,
+              child: Container(
+                padding: const EdgeInsets.all(3),
+                decoration: BoxDecoration(
+                  color: f.type.color.withA(0.9),
+                  borderRadius: BorderRadius.circular(5),
+                ),
+                child: Icon(f.type.icon, color: Colors.black, size: 11),
+              ),
+            ),
+          if (f.modifiedDate != null)
+            Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 2),
+                decoration: BoxDecoration(
+                  borderRadius: const BorderRadius.vertical(
+                    bottom: Radius.circular(7),
+                  ),
+                  gradient: LinearGradient(
+                    begin: Alignment.bottomCenter,
+                    end: Alignment.topCenter,
+                    colors: [Colors.black.withA(0.75), Colors.transparent],
                   ),
                 ),
-                const SizedBox(width: 4),
-                Text('${file.confidence}%',
-                    style: TextStyle(color: file.type.color, fontSize: 10)),
-              ]),
-            ]),
-          ),
-          const SizedBox(width: 8),
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 150),
-            width: 22, height: 22,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: file.selected ? file.type.color : Colors.transparent,
-              border: Border.all(
-                color: file.selected ? file.type.color : const Color(0xFF1A2740),
-                width: 2,
+                child: Text(
+                  f.shortDate,
+                  style: const TextStyle(color: Colors.white70, fontSize: 7),
+                  textAlign: TextAlign.center,
+                ),
               ),
             ),
-            child: file.selected
-                ? const Icon(Icons.check, size: 12, color: Colors.black)
-                : null,
-          ),
-        ]),
+        ],
       ),
     );
   }
 
-  void _preview(RFile file) {
-    Navigator.push(context,
-        MaterialPageRoute(builder: (_) => PreviewScreen(file: file)));
+  // ── LIST ──
+  Widget _listView(List<RFile> list) {
+    return Scrollbar(
+      controller: _scrollCtrl,
+      interactive: true,
+      child: ListView.builder(
+        controller: _scrollCtrl,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        itemCount: list.length,
+        itemBuilder: (_, i) => RepaintBoundary(child: _listItem(list[i])),
+      ),
+    );
   }
 
-  Widget _buildBottomBar() {
+  Widget _listItem(RFile f) {
+    return GestureDetector(
+      onTap: () => _open(f),
+      onLongPress: () => setState(() => f.selected = !f.selected),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 120),
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          color: f.selected ? f.type.color.withA(0.08) : const Color(0xFF0D1321),
+          border: Border.all(
+            color: f.selected
+                ? f.type.color.withA(0.4)
+                : const Color(0xFF1A2740),
+          ),
+        ),
+        child: Row(
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: SizedBox(width: 56, height: 56, child: _thumb(f)),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    f.name,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 2),
+                  if (f.modifiedDate != null)
+                    Text(
+                      f.dateLabel,
+                      style: const TextStyle(
+                        color: Color(0xFF4A6FA5),
+                        fontSize: 10,
+                      ),
+                    ),
+                  const SizedBox(height: 3),
+                  Row(
+                    children: [
+                      Text(
+                        f.sizeLabel,
+                        style: const TextStyle(
+                          color: Color(0xFF4A6FA5),
+                          fontSize: 11,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      SizedBox(
+                        width: 48,
+                        height: 3,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(2),
+                          child: LinearProgressIndicator(
+                            value: f.confidence / 100,
+                            backgroundColor: const Color(0xFF1A2740),
+                            valueColor: AlwaysStoppedAnimation(f.type.color),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        '${f.confidence}%',
+                        style: TextStyle(color: f.type.color, fontSize: 10),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              width: 22,
+              height: 22,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: f.selected ? f.type.color : Colors.transparent,
+                border: Border.all(
+                  color: f.selected ? f.type.color : const Color(0xFF1A2740),
+                  width: 2,
+                ),
+              ),
+              child: f.selected
+                  ? const Icon(Icons.check, size: 12, color: Colors.black)
+                  : null,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _thumb(RFile f) {
+    if (f.isImage) {
+      return Image.file(
+        File(f.path),
+        fit: BoxFit.cover,
+        cacheWidth: 300,
+        gaplessPlayback: true,
+        errorBuilder: (_, _, _) => _placeholder(f),
+      );
+    }
+    if (f.isVideo) {
+      return _VideoThumb(path: f.path, file: f);
+    }
+    return _placeholder(f);
+  }
+
+  Widget _placeholder(RFile f) {
     return Container(
-      margin: const EdgeInsets.all(16),
-      padding: const EdgeInsets.all(14),
+      color: f.type.color.withA(0.08),
+      child: Center(child: Icon(f.type.icon, color: f.type.color, size: 28)),
+    );
+  }
+
+  void _open(RFile f) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => PreviewScreen(file: f)),
+    );
+  }
+
+  Widget _bottomBar() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: BoxDecoration(
         color: const Color(0xFF0D1321),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: const Color(0xFF1A2740)),
       ),
-      child: Row(children: [
-        Column(crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min, children: [
-          Text('$_selectedCount selected',
-              style: const TextStyle(
-                  color: Colors.white, fontWeight: FontWeight.w600, fontSize: 13)),
-          const Text('/Download/Recovered/',
-              style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 10)),
-        ]),
-        const Spacer(),
-        GestureDetector(
-          onTap: _recover,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-            decoration: BoxDecoration(
-              gradient: const LinearGradient(
-                  colors: [Color(0xFF00B8D4), Color(0xFF00E5FF)]),
-              borderRadius: BorderRadius.circular(12),
-              boxShadow: [BoxShadow(
-                color: const Color(0xFF00E5FF).withA(0.3),
-                blurRadius: 12, offset: const Offset(0, 4),
-              )],
-            ),
-            child: const Row(mainAxisSize: MainAxisSize.min, children: [
-              Icon(Icons.download_rounded, color: Colors.black, size: 18),
-              SizedBox(width: 6),
-              Text('RECOVER', style: TextStyle(
-                color: Colors.black, fontWeight: FontWeight.bold,
-                fontSize: 13, letterSpacing: 1,
-              )),
-            ]),
+      child: Row(
+        children: [
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '$_selCount selected',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                ),
+              ),
+              const Text(
+                '/Download/Recovered/',
+                style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 10),
+              ),
+            ],
           ),
-        ),
-      ]),
-    );
-  }
-
-  void _recover() {
-    final sel = widget.files.where((f) => f.selected).toList();
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => RecoveryDialog(files: sel),
+          const Spacer(),
+          GestureDetector(
+            onTap: _deleteSelected,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFF4081).withA(0.15),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFFFF4081).withA(0.4)),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.delete_rounded, color: Color(0xFFFF4081), size: 18),
+                  SizedBox(width: 4),
+                  Text(
+                    'DELETE',
+                    style: TextStyle(
+                      color: Color(0xFFFF4081),
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          GestureDetector(
+            onTap: () => showDialog(
+              context: context,
+              barrierDismissible: false,
+              builder: (_) => RecoveryDialog(
+                files: widget.files.where((f) => f.selected).toList(),
+              ),
+            ),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFF00B8D4), Color(0xFF00E5FF)],
+                ),
+                borderRadius: BorderRadius.circular(12),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF00E5FF).withA(0.3),
+                    blurRadius: 12,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.download_rounded, color: Colors.black, size: 18),
+                  SizedBox(width: 4),
+                  Text(
+                    'RECOVER',
+                    style: TextStyle(
+                      color: Colors.black,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
 
-// ─────────────────────────────────────────────
-//  Video Thumbnail Widget (async, cached)
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  VIDEO THUMBNAIL  (async + LRU cached)
+// ══════════════════════════════════════════════════════
 
 class _VideoThumb extends StatefulWidget {
   final String path;
@@ -1233,7 +1860,7 @@ class _VideoThumb extends StatefulWidget {
 }
 
 class _VideoThumbState extends State<_VideoThumb> {
-  Uint8List? _thumb;
+  Uint8List? _data;
   bool _loading = true;
 
   @override
@@ -1243,37 +1870,47 @@ class _VideoThumbState extends State<_VideoThumb> {
   }
 
   Future<void> _load() async {
-    final data = await ThumbnailCache.get(widget.path);
-    if (mounted) setState(() { _thumb = data; _loading = false; });
+    final d = await _ThumbCache.get(widget.path);
+    if (mounted) {
+      setState(() {
+        _data = d;
+        _loading = false;
+      });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     if (_loading) {
       return Container(
-        color: widget.file.type.color.withA(0.08),
+        color: const Color(0xFFFF4081).withA(0.06),
         child: const Center(
           child: SizedBox(
-            width: 20, height: 20,
+            width: 18,
+            height: 18,
             child: CircularProgressIndicator(
-                color: Color(0xFFFF4081), strokeWidth: 2),
+              color: Color(0xFFFF4081),
+              strokeWidth: 2,
+            ),
           ),
         ),
       );
     }
-    if (_thumb != null) {
-      return Image.memory(_thumb!, fit: BoxFit.cover);
+    if (_data != null) {
+      return Image.memory(_data!, fit: BoxFit.cover, gaplessPlayback: true);
     }
     return Container(
-      color: widget.file.type.color.withA(0.08),
-      child: Icon(widget.file.type.icon, color: widget.file.type.color, size: 28),
+      color: const Color(0xFFFF4081).withA(0.08),
+      child: const Center(
+        child: Icon(Icons.videocam_rounded, color: Color(0xFFFF4081), size: 26),
+      ),
     );
   }
 }
 
-// ─────────────────────────────────────────────
-//  Preview Screen — Photo zoom + Video player
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  PREVIEW SCREEN
+// ══════════════════════════════════════════════════════
 
 class PreviewScreen extends StatelessWidget {
   final RFile file;
@@ -1290,268 +1927,486 @@ class PreviewScreen extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(file.name,
-                style: const TextStyle(fontSize: 13),
-                overflow: TextOverflow.ellipsis),
+            Text(
+              file.name,
+              style: const TextStyle(fontSize: 13),
+              overflow: TextOverflow.ellipsis,
+            ),
             if (file.modifiedDate != null)
-              Text(file.dateLabel,
-                  style: const TextStyle(fontSize: 10, color: Colors.grey)),
+              Text(
+                file.dateLabel,
+                style: const TextStyle(fontSize: 10, color: Colors.grey),
+              ),
           ],
         ),
         actions: [
           IconButton(
             icon: const Icon(Icons.download_rounded, color: Color(0xFF00E5FF)),
-            onPressed: () => _saveFile(context),
+            onPressed: () => _save(context),
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_rounded, color: Color(0xFFFF4081)),
+            onPressed: () => _confirmDelete(context),
           ),
         ],
       ),
-      body: _buildBody(context),
+      body: _body(context),
     );
   }
 
-  void _saveFile(BuildContext context) {
-    try {
-      final out = '/storage/emulated/0/Download/Recovered/${file.name}';
-      final dir = Directory('/storage/emulated/0/Download/Recovered');
-      if (!dir.existsSync()) dir.createSync(recursive: true);
-      File(file.path).copySync(out);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Saved to $out'),
-          backgroundColor: const Color(0xFF69FF47),
-        ),
-      );
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e'),
-            backgroundColor: const Color(0xFFFF4081)),
-      );
-    }
-  }
-
-  Widget _buildBody(BuildContext context) {
+  Widget _body(BuildContext context) {
     if (file.isImage) {
       return PhotoView(
         imageProvider: FileImage(File(file.path)),
         minScale: PhotoViewComputedScale.contained,
-        maxScale: PhotoViewComputedScale.covered * 4,
+        maxScale: PhotoViewComputedScale.covered * 5,
         backgroundDecoration: const BoxDecoration(color: Colors.black),
-        loadingBuilder: (_, event) => Center(
+        loadingBuilder: (_, ev) => Center(
           child: CircularProgressIndicator(
-            value: event?.expectedTotalBytes != null
-                ? event!.cumulativeBytesLoaded / event.expectedTotalBytes!
+            value: ev?.expectedTotalBytes != null
+                ? ev!.cumulativeBytesLoaded / ev.expectedTotalBytes!
                 : null,
             color: const Color(0xFF00E5FF),
           ),
         ),
-        errorBuilder: (_, e, s) => _noPreview(),
+        errorBuilder: (_, _, _) => Center(child: _noPreview()),
       );
     }
     if (file.isVideo) {
-      return VideoPlayerScreen(file: file);
+      return _VideoPlayer(file: file);
     }
     return Center(child: _noPreview());
   }
 
+  void _save(BuildContext ctx) {
+    try {
+      Directory('/storage/emulated/0/Download/Recovered').createSync(recursive: true);
+      File(file.path)
+          .copySync('/storage/emulated/0/Download/Recovered/${file.name}');
+      ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(
+        content: Text('Saved to /Download/Recovered/'),
+        backgroundColor: Color(0xFF69FF47),
+      ));
+    } catch (e) {
+      ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
+        content: Text('Save failed: $e'),
+        backgroundColor: const Color(0xFFFF4081),
+      ));
+    }
+  }
+
+  void _confirmDelete(BuildContext ctx) async {
+    final ok = await showDialog<bool>(
+      context: ctx,
+      builder: (_) => const _ConfirmDialog(
+        title: 'Delete this file?',
+        body: 'This action cannot be undone.',
+        confirm: 'DELETE',
+        confirmColor: Color(0xFFFF4081),
+      ),
+    );
+    if (ok != true) {
+      return;
+    }
+    try {
+      File(file.path).deleteSync();
+      if (ctx.mounted) {
+        ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(
+          content: Text('File deleted'),
+          backgroundColor: Color(0xFFFF4081),
+        ));
+        Navigator.pop(ctx);
+      }
+    } catch (e) {
+      if (ctx.mounted) {
+        ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
+          content: Text('Error: $e'),
+          backgroundColor: const Color(0xFFFF4081),
+        ));
+      }
+    }
+  }
+
   Widget _noPreview() {
-    return Column(mainAxisSize: MainAxisSize.min, children: [
-      Icon(file.type.icon, color: file.type.color, size: 80),
-      const SizedBox(height: 16),
-      Text(file.name, style: const TextStyle(color: Colors.white, fontSize: 14),
-          textAlign: TextAlign.center),
-      const SizedBox(height: 8),
-      Text(file.sizeLabel, style: const TextStyle(color: Colors.grey, fontSize: 12)),
-      const SizedBox(height: 4),
-      Text(file.dateLabel, style: const TextStyle(color: Colors.grey, fontSize: 11)),
-      const SizedBox(height: 4),
-      Text('${file.confidence}% confidence',
-          style: TextStyle(color: file.type.color, fontSize: 12)),
-    ]);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(file.type.icon, color: file.type.color, size: 80),
+        const SizedBox(height: 16),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Text(
+            file.name,
+            style: const TextStyle(color: Colors.white, fontSize: 14),
+            textAlign: TextAlign.center,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(file.sizeLabel, style: const TextStyle(color: Colors.grey, fontSize: 12)),
+        if (file.modifiedDate != null) ...[
+          const SizedBox(height: 4),
+          Text(file.dateLabel, style: const TextStyle(color: Colors.grey, fontSize: 11)),
+        ],
+        const SizedBox(height: 4),
+        Text(
+          '${file.confidence}% confidence',
+          style: TextStyle(color: file.type.color, fontSize: 12),
+        ),
+      ],
+    );
   }
 }
 
-// ─────────────────────────────────────────────
-//  Video Player Screen — full controls
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  VIDEO PLAYER  (full controls, seek bar, +/- 10s)
+// ══════════════════════════════════════════════════════
 
-class VideoPlayerScreen extends StatefulWidget {
+class _VideoPlayer extends StatefulWidget {
   final RFile file;
-  const VideoPlayerScreen({super.key, required this.file});
+  const _VideoPlayer({required this.file});
   @override
-  State<VideoPlayerScreen> createState() => _VideoPlayerScreenState();
+  State<_VideoPlayer> createState() => _VideoPlayerState();
 }
 
-class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
-  late VideoPlayerController _controller;
-  bool _initialized = false;
-  bool _showControls = true;
+class _VideoPlayerState extends State<_VideoPlayer> {
+  VideoPlayerController? _ctrl;
+  bool _ready = false;
+  bool _showCtrl = true;
   Timer? _hideTimer;
 
   @override
   void initState() {
     super.initState();
-    _controller = VideoPlayerController.file(File(widget.file.path))
-      ..initialize().then((_) {
-        if (mounted) setState(() => _initialized = true);
-        _controller.play();
-        _scheduleHide();
-      });
-    _controller.addListener(() { if (mounted) setState(() {}); });
+    _init();
   }
 
-  void _scheduleHide() {
+  Future<void> _init() async {
+    try {
+      _ctrl = VideoPlayerController.file(File(widget.file.path));
+      await _ctrl!.initialize();
+      _ctrl!.addListener(() {
+        if (mounted) {
+          setState(() {});
+        }
+      });
+      if (mounted) {
+        setState(() => _ready = true);
+      }
+      _ctrl!.play();
+      _sched();
+    } catch (_) {}
+  }
+
+  void _sched() {
     _hideTimer?.cancel();
     _hideTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted) setState(() => _showControls = false);
+      if (mounted) {
+        setState(() => _showCtrl = false);
+      }
     });
   }
 
-  void _toggleControls() {
-    setState(() => _showControls = !_showControls);
-    if (_showControls) _scheduleHide();
+  void _tap() {
+    setState(() => _showCtrl = !_showCtrl);
+    if (_showCtrl) {
+      _sched();
+    }
   }
 
-  void _togglePlay() {
-    setState(() {
-      _controller.value.isPlaying ? _controller.pause() : _controller.play();
-    });
-    _scheduleHide();
+  void _playPause() {
+    if (_ctrl == null) {
+      return;
+    }
+    _ctrl!.value.isPlaying ? _ctrl!.pause() : _ctrl!.play();
+    setState(() {});
+    _sched();
   }
 
   @override
   void dispose() {
     _hideTimer?.cancel();
-    _controller.dispose();
+    _ctrl?.dispose();
     super.dispose();
   }
 
   String _fmt(Duration d) {
+    final h = d.inHours;
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return '${d.inHours > 0 ? '${d.inHours}:' : ''}$m:$s';
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!_initialized) {
+    if (!_ready || _ctrl == null) {
       return const Center(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          CircularProgressIndicator(color: Color(0xFFFF4081)),
-          SizedBox(height: 16),
-          Text('Loading video...', style: TextStyle(color: Colors.white54)),
-        ]),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(color: Color(0xFFFF4081)),
+            SizedBox(height: 14),
+            Text(
+              'Loading video…',
+              style: TextStyle(color: Colors.white54, fontSize: 13),
+            ),
+          ],
+        ),
       );
     }
 
-    final pos = _controller.value.position;
-    final dur = _controller.value.duration;
-    final playing = _controller.value.isPlaying;
+    final pos = _ctrl!.value.position;
+    final dur = _ctrl!.value.duration;
+    final playing = _ctrl!.value.isPlaying;
 
     return GestureDetector(
-      onTap: _toggleControls,
-      child: Stack(fit: StackFit.expand, children: [
-        // Video
-        Center(
-          child: AspectRatio(
-            aspectRatio: _controller.value.aspectRatio,
-            child: VideoPlayer(_controller),
+      onTap: _tap,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          Center(
+            child: AspectRatio(
+              aspectRatio: _ctrl!.value.aspectRatio,
+              child: VideoPlayer(_ctrl!),
+            ),
           ),
-        ),
-
-        // Controls overlay
-        AnimatedOpacity(
-          opacity: _showControls ? 1.0 : 0.0,
-          duration: const Duration(milliseconds: 300),
-          child: IgnorePointer(
-            ignoring: !_showControls,
-            child: Column(children: [
-              const Spacer(),
-              // Progress + time
-              Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.bottomCenter,
-                    end: Alignment.topCenter,
-                    colors: [Colors.black.withAlpha(200), Colors.transparent],
-                  ),
-                ),
-                padding: const EdgeInsets.fromLTRB(16, 32, 16, 16),
-                child: Column(children: [
-                  // Seek bar
-                  SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      activeTrackColor: const Color(0xFFFF4081),
-                      inactiveTrackColor: Colors.white24,
-                      thumbColor: const Color(0xFFFF4081),
-                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
-                      overlayShape: const RoundSliderOverlayShape(overlayRadius: 16),
-                      trackHeight: 3,
-                    ),
-                    child: Slider(
-                      value: dur.inMilliseconds > 0
-                          ? pos.inMilliseconds.toDouble().clamp(0, dur.inMilliseconds.toDouble())
-                          : 0,
-                      min: 0,
-                      max: dur.inMilliseconds.toDouble(),
-                      onChanged: (v) {
-                        _controller.seekTo(Duration(milliseconds: v.toInt()));
-                        _scheduleHide();
-                      },
-                    ),
-                  ),
-                  // Time + controls
-                  Row(children: [
-                    Text(_fmt(pos), style: const TextStyle(color: Colors.white70, fontSize: 11)),
-                    const Text(' / ', style: TextStyle(color: Colors.white38, fontSize: 11)),
-                    Text(_fmt(dur), style: const TextStyle(color: Colors.white70, fontSize: 11)),
-                    const Spacer(),
-                    // Rewind 10s
-                    GestureDetector(
-                      onTap: () {
-                        _controller.seekTo(pos - const Duration(seconds: 10));
-                        _scheduleHide();
-                      },
-                      child: const Icon(Icons.replay_10, color: Colors.white, size: 28),
-                    ),
-                    const SizedBox(width: 16),
-                    // Play/Pause
-                    GestureDetector(
-                      onTap: _togglePlay,
-                      child: Container(
-                        width: 52, height: 52,
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFFF4081).withAlpha(220),
-                          shape: BoxShape.circle,
-                        ),
-                        child: Icon(
-                          playing ? Icons.pause : Icons.play_arrow,
-                          color: Colors.white, size: 30,
-                        ),
+          AnimatedOpacity(
+            opacity: _showCtrl ? 1.0 : 0.0,
+            duration: const Duration(milliseconds: 250),
+            child: IgnorePointer(
+              ignoring: !_showCtrl,
+              child: Column(
+                children: [
+                  const Spacer(),
+                  Container(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.bottomCenter,
+                        end: Alignment.topCenter,
+                        colors: [
+                          Colors.black.withAlpha(210),
+                          Colors.transparent,
+                        ],
                       ),
                     ),
-                    const SizedBox(width: 16),
-                    // Forward 10s
-                    GestureDetector(
-                      onTap: () {
-                        _controller.seekTo(pos + const Duration(seconds: 10));
-                        _scheduleHide();
-                      },
-                      child: const Icon(Icons.forward_10, color: Colors.white, size: 28),
+                    padding: const EdgeInsets.fromLTRB(16, 40, 16, 16),
+                    child: Column(
+                      children: [
+                        SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            activeTrackColor: const Color(0xFFFF4081),
+                            inactiveTrackColor: Colors.white24,
+                            thumbColor: const Color(0xFFFF4081),
+                            thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 8,
+                            ),
+                            overlayShape: const RoundSliderOverlayShape(
+                              overlayRadius: 18,
+                            ),
+                            trackHeight: 3,
+                          ),
+                          child: Slider(
+                            value: dur.inMilliseconds > 0
+                                ? pos.inMilliseconds
+                                    .toDouble()
+                                    .clamp(0, dur.inMilliseconds.toDouble())
+                                : 0,
+                            min: 0,
+                            max: dur.inMilliseconds > 0
+                                ? dur.inMilliseconds.toDouble()
+                                : 1,
+                            onChanged: (v) {
+                              _ctrl!.seekTo(Duration(milliseconds: v.toInt()));
+                              _sched();
+                            },
+                          ),
+                        ),
+                        Row(
+                          children: [
+                            Text(
+                              _fmt(pos),
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 11,
+                              ),
+                            ),
+                            Text(
+                              ' / ',
+                              style: TextStyle(
+                                color: Colors.white.withA(0.3),
+                                fontSize: 11,
+                              ),
+                            ),
+                            Text(
+                              _fmt(dur),
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 11,
+                              ),
+                            ),
+                            const Spacer(),
+                            GestureDetector(
+                              onTap: () {
+                                _ctrl!.seekTo(
+                                  pos - const Duration(seconds: 10),
+                                );
+                                _sched();
+                              },
+                              child: const Icon(
+                                Icons.replay_10,
+                                color: Colors.white,
+                                size: 30,
+                              ),
+                            ),
+                            const SizedBox(width: 14),
+                            GestureDetector(
+                              onTap: _playPause,
+                              child: Container(
+                                width: 52,
+                                height: 52,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFFF4081).withAlpha(220),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Icon(
+                                  playing ? Icons.pause : Icons.play_arrow,
+                                  color: Colors.white,
+                                  size: 30,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 14),
+                            GestureDetector(
+                              onTap: () {
+                                _ctrl!.seekTo(
+                                  pos + const Duration(seconds: 10),
+                                );
+                                _sched();
+                              },
+                              child: const Icon(
+                                Icons.forward_10,
+                                color: Colors.white,
+                                size: 30,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
-                  ]),
-                ]),
+                  ),
+                ],
               ),
-            ]),
+            ),
           ),
-        ),
-      ]),
+        ],
+      ),
     );
   }
 }
 
-// ─────────────────────────────────────────────
-//  Recovery Dialog
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════
+//  CONFIRM DIALOG
+// ══════════════════════════════════════════════════════
+
+class _ConfirmDialog extends StatelessWidget {
+  final String title;
+  final String body;
+  final String confirm;
+  final Color confirmColor;
+  const _ConfirmDialog({
+    required this.title,
+    required this.body,
+    required this.confirm,
+    required this.confirmColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: const Color(0xFF0D1321),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.warning_rounded, color: confirmColor, size: 48),
+            const SizedBox(height: 14),
+            Text(
+              title,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 10),
+            Text(
+              body,
+              style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 13),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 24),
+            Row(
+              children: [
+                Expanded(
+                  child: GestureDetector(
+                    onTap: () => Navigator.pop(context, false),
+                    child: Container(
+                      height: 44,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1A2740),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Center(
+                        child: Text(
+                          'CANCEL',
+                          style: TextStyle(
+                            color: Color(0xFF4A6FA5),
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: GestureDetector(
+                    onTap: () => Navigator.pop(context, true),
+                    child: Container(
+                      height: 44,
+                      decoration: BoxDecoration(
+                        color: confirmColor.withA(0.15),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: confirmColor.withA(0.5)),
+                      ),
+                      child: Center(
+                        child: Text(
+                          confirm,
+                          style: TextStyle(
+                            color: confirmColor,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  RECOVERY DIALOG
+// ══════════════════════════════════════════════════════
 
 class RecoveryDialog extends StatefulWidget {
   final List<RFile> files;
@@ -1561,91 +2416,128 @@ class RecoveryDialog extends StatefulWidget {
 }
 
 class _RecoveryDialogState extends State<RecoveryDialog> {
-  int _current = 0;
-  int _success = 0;
+  int _cur = 0;
+  int _ok = 0;
   bool _done = false;
   Timer? _t;
 
   @override
-  void initState() { super.initState(); _process(); }
+  void initState() {
+    super.initState();
+    _run();
+  }
 
-  void _process() {
-    _t = Timer.periodic(const Duration(milliseconds: 200), (t) {
-      if (_current >= widget.files.length) {
+  void _run() {
+    _t = Timer.periodic(const Duration(milliseconds: 150), (t) {
+      if (_cur >= widget.files.length) {
         t.cancel();
         setState(() => _done = true);
         return;
       }
-      final f = widget.files[_current];
+      final f = widget.files[_cur];
       try {
-        final out = '/storage/emulated/0/Download/Recovered/${f.name}';
-        final dir = Directory('/storage/emulated/0/Download/Recovered');
-        if (!dir.existsSync()) dir.createSync(recursive: true);
-        File(f.path).copySync(out);
-        setState(() { _success++; _current++; });
+        Directory('/storage/emulated/0/Download/Recovered')
+            .createSync(recursive: true);
+        File(f.path).copySync(
+          '/storage/emulated/0/Download/Recovered/${f.name}',
+        );
+        setState(() {
+          _ok++;
+          _cur++;
+        });
       } catch (_) {
-        setState(() => _current++);
+        setState(() => _cur++);
       }
     });
   }
 
   @override
-  void dispose() { _t?.cancel(); super.dispose(); }
+  void dispose() {
+    _t?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final prog = widget.files.isEmpty ? 1.0 : _current / widget.files.length;
+    final prog =
+        widget.files.isEmpty ? 1.0 : _cur / widget.files.length;
     return Dialog(
       backgroundColor: const Color(0xFF0D1321),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
       child: Padding(
         padding: const EdgeInsets.all(24),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Icon(
-            _done ? Icons.check_circle_rounded : Icons.download_rounded,
-            color: _done ? const Color(0xFF69FF47) : const Color(0xFF00E5FF),
-            size: 52,
-          ),
-          const SizedBox(height: 16),
-          Text(_done ? 'Recovery Complete!' : 'Recovering...',
-              style: const TextStyle(
-                  color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          Text('$_current / ${widget.files.length}',
-              style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 13)),
-          const SizedBox(height: 16),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: LinearProgressIndicator(
-              value: prog,
-              backgroundColor: const Color(0xFF1A2740),
-              valueColor: AlwaysStoppedAnimation(
-                  _done ? const Color(0xFF69FF47) : const Color(0xFF00E5FF)),
-              minHeight: 6,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _done ? Icons.check_circle_rounded : Icons.download_rounded,
+              color:
+                  _done ? const Color(0xFF69FF47) : const Color(0xFF00E5FF),
+              size: 52,
             ),
-          ),
-          if (_done) ...[
-            const SizedBox(height: 16),
-            Text('$_success files → /Download/Recovered/',
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 12)),
-            const SizedBox(height: 20),
-            GestureDetector(
-              onTap: () => Navigator.of(context).pop(),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
-                decoration: BoxDecoration(
-                  gradient: const LinearGradient(
-                      colors: [Color(0xFF00B8D4), Color(0xFF00E5FF)]),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: const Text('DONE', style: TextStyle(
-                  color: Colors.black, fontWeight: FontWeight.bold, letterSpacing: 2,
-                )),
+            const SizedBox(height: 14),
+            Text(
+              _done ? 'Recovery Complete!' : 'Recovering…',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
               ),
             ),
+            const SizedBox(height: 6),
+            Text(
+              '$_cur / ${widget.files.length}',
+              style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 13),
+            ),
+            const SizedBox(height: 14),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: prog,
+                backgroundColor: const Color(0xFF1A2740),
+                valueColor: AlwaysStoppedAnimation(
+                  _done ? const Color(0xFF69FF47) : const Color(0xFF00E5FF),
+                ),
+                minHeight: 6,
+              ),
+            ),
+            if (_done) ...[
+              const SizedBox(height: 14),
+              Text(
+                '$_ok file${_ok != 1 ? 's' : ''} → /Download/Recovered/',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFF4A6FA5),
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 20),
+              GestureDetector(
+                onTap: () => Navigator.of(context).pop(),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 32,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    gradient: const LinearGradient(
+                      colors: [Color(0xFF00B8D4), Color(0xFF00E5FF)],
+                    ),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Text(
+                    'DONE',
+                    style: TextStyle(
+                      color: Colors.black,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 2,
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ],
-        ]),
+        ),
       ),
     );
   }
