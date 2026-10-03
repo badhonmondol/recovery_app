@@ -312,24 +312,14 @@ class MainActivity : FlutterActivity() {
     }
 
     // ── Deleted / trashed MediaStore entries (Android 10+) ──
-    // IS_TRASHED = 1  → user moved to trash
-    // IS_PENDING = 1  → write not completed (partially downloaded / interrupted)
-    // Both are "recoverable" candidates.
     private fun scanDeletedMediaStore(): List<Map<String, Any>> {
         val out = mutableListOf<Map<String, Any>>()
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return out
 
-        // On Android 11+ we must pass QUERY_ARG_MATCH_TRASHED to see trash
         val uris = listOf(
-            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL),
-            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL),
-            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
-        )
-
-        val typeMap = mapOf(
-            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL).toString() to "image",
-            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL).toString() to "video",
-            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL).toString() to "audio"
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL) to "image",
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)  to "video",
+            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)  to "audio"
         )
 
         val projection = arrayOf(
@@ -340,89 +330,54 @@ class MainActivity : FlutterActivity() {
             MediaStore.MediaColumns.DATE_MODIFIED
         )
 
-        for (uri in uris) {
+        for ((uri, type) in uris) {
             try {
-                // Build a bundle query to include trashed & pending items
-                val queryArgs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    android.os.Bundle().apply {
-                        // Show trashed files
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    // Android 11+: Bundle query with match-trashed
+                    val bundle = android.os.Bundle().apply {
                         putInt("android:query-arg-match-trashed", 1)
-                        // Show pending files
                         putInt("android:query-arg-match-pending", 1)
-                        // Only return trashed OR pending (not normal live files)
                         putString(
-                            android.content.ContentResolver.QUERY_ARG_SQL_SELECTION,
+                            "android:query-arg-sql-selection",
                             "${MediaStore.MediaColumns.IS_TRASHED} = 1 OR ${MediaStore.MediaColumns.IS_PENDING} = 1"
                         )
-                        putInt(
-                            android.content.ContentResolver.QUERY_ARG_SORT_DIRECTION,
-                            android.content.ContentResolver.QUERY_SORT_DIRECTION_DESCENDING
-                        )
-                        putStringArray(
-                            android.content.ContentResolver.QUERY_ARG_SORT_COLUMNS,
-                            arrayOf(MediaStore.MediaColumns.DATE_MODIFIED)
-                        )
                     }
+                    contentResolver.query(uri, projection, bundle, null)
                 } else {
-                    // API 29 — no Bundle query, use selection string
-                    null
-                }
-
-                val cursor = if (queryArgs != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    contentResolver.query(uri, projection, queryArgs, null)
-                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    // Android 10: selection-based
+                    // Android 10 (Q): only pending items accessible without special flag
                     contentResolver.query(
                         uri, projection,
                         "${MediaStore.MediaColumns.IS_PENDING} = 1",
                         null,
                         "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
                     )
-                } else {
-                    null
-                }
-
-                cursor?.use { c ->
+                }?.use { c ->
                     val idCol   = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
                     val nameCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
                     val dataCol = c.getColumnIndex(MediaStore.MediaColumns.DATA)
                     val sizeCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
                     val dateCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
-
                     while (c.moveToNext()) {
                         val id   = c.getLong(idCol)
                         val name = c.getString(nameCol) ?: continue
                         val size = c.getLong(sizeCol)
+                        if (size <= 0) continue
                         val date = c.getLong(dateCol) * 1000L
-
-                        val path: String = if (dataCol >= 0 && c.getString(dataCol) != null) {
-                            c.getString(dataCol)!!
+                        val path = if (dataCol >= 0) {
+                            c.getString(dataCol) ?: ContentUris.withAppendedId(uri, id).toString()
                         } else {
                             ContentUris.withAppendedId(uri, id).toString()
                         }
-
-                        if (size <= 0) continue
-
-                        val type = typeMap[uri.toString()] ?: "image"
-                        out.add(mapOf(
-                            "n"  to name,
-                            "p"  to path,
-                            "t"  to type,
-                            "s"  to size,
-                            "m"  to date,
-                            "del" to true   // mark as confirmed-deleted
-                        ))
+                        out.add(mapOf("n" to name, "p" to path, "t" to type, "s" to size, "m" to date, "del" to true))
                     }
                 }
-            } catch (e: Exception) {
-                // This uri/query unsupported on this device — continue
-            }
+            } catch (e: Exception) { /* uri unsupported — skip */ }
         }
 
-        // Also query Files collection for deleted documents
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val docUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
+        // Deleted documents (API 30+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val docUri  = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL)
                 val docMimes = arrayOf(
                     "application/pdf",
                     "application/msword",
@@ -431,28 +386,25 @@ class MainActivity : FlutterActivity() {
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     "text/plain"
                 )
-                val placeholders = docMimes.joinToString(",") { "?" }
-                val docProjection = arrayOf(
+                val ph = docMimes.joinToString(",") { "?" }
+                val bundle = android.os.Bundle().apply {
+                    putInt("android:query-arg-match-trashed", 1)
+                    putInt("android:query-arg-match-pending", 1)
+                    putString(
+                        "android:query-arg-sql-selection",
+                        "(${MediaStore.Files.FileColumns.IS_TRASHED} = 1 OR ${MediaStore.Files.FileColumns.IS_PENDING} = 1)" +
+                        " AND ${MediaStore.Files.FileColumns.MIME_TYPE} IN ($ph)" +
+                        " AND ${MediaStore.Files.FileColumns.SIZE} > 0"
+                    )
+                    putStringArray("android:query-arg-sql-selection-args", docMimes)
+                }
+                val docProj = arrayOf(
                     MediaStore.Files.FileColumns.DISPLAY_NAME,
                     MediaStore.Files.FileColumns.DATA,
                     MediaStore.Files.FileColumns.SIZE,
                     MediaStore.Files.FileColumns.DATE_MODIFIED
                 )
-                val docQueryArgs = android.os.Bundle().apply {
-                    putInt("android:query-arg-match-trashed", 1)
-                    putInt("android:query-arg-match-pending", 1)
-                    putString(
-                        android.content.ContentResolver.QUERY_ARG_SQL_SELECTION,
-                        "(${MediaStore.Files.FileColumns.IS_TRASHED} = 1 OR ${MediaStore.Files.FileColumns.IS_PENDING} = 1)" +
-                        " AND ${MediaStore.Files.FileColumns.MIME_TYPE} IN ($placeholders)" +
-                        " AND ${MediaStore.Files.FileColumns.SIZE} > 0"
-                    )
-                    putStringArray(
-                        android.content.ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
-                        docMimes
-                    )
-                }
-                contentResolver.query(docUri, docProjection, docQueryArgs, null)?.use { c ->
+                contentResolver.query(docUri, docProj, bundle, null)?.use { c ->
                     val nameCol = c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
                     val dataCol = c.getColumnIndex(MediaStore.Files.FileColumns.DATA)
                     val sizeCol = c.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE)
@@ -460,21 +412,14 @@ class MainActivity : FlutterActivity() {
                     while (c.moveToNext()) {
                         val name = c.getString(nameCol) ?: continue
                         val size = c.getLong(sizeCol)
+                        if (size <= 0) continue
                         val date = c.getLong(dateCol) * 1000L
                         val path = if (dataCol >= 0) c.getString(dataCol) ?: continue else continue
-                        if (size <= 0) continue
-                        out.add(mapOf(
-                            "n"  to name,
-                            "p"  to path,
-                            "t"  to "document",
-                            "s"  to size,
-                            "m"  to date,
-                            "del" to true
-                        ))
+                        out.add(mapOf("n" to name, "p" to path, "t" to "document", "s" to size, "m" to date, "del" to true))
                     }
                 }
-            }
-        } catch (e: Exception) { /* ignore */ }
+            } catch (e: Exception) { /* ignore */ }
+        }
 
         return out
     }
