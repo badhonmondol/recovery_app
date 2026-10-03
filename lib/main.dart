@@ -8,15 +8,21 @@ import 'package:intl/intl.dart';
 import 'package:photo_view/photo_view.dart';
 import 'package:video_player/video_player.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:flutter_pdfview/flutter_pdfview.dart';
+import 'package:share_plus/share_plus.dart';
 
 // ══════════════════════════════════════════════════════
-//  THUMBNAIL CACHE  (LRU, max 200 entries)
+//  THUMBNAIL CACHE  (LRU, max 200 entries, concurrent 4)
 // ══════════════════════════════════════════════════════
 
 class _ThumbCache {
   static final LinkedHashMap<String, Uint8List?> _map = LinkedHashMap();
   static final Map<String, Future<Uint8List?>> _pending = {};
   static const int _max = 200;
+  static const int _maxActive = 4;
+  static int _activeCount = 0;
+  static final List<_QueuedTask> _queue = [];
 
   static Future<Uint8List?> get(String path) async {
     if (_map.containsKey(path)) {
@@ -27,20 +33,25 @@ class _ThumbCache {
     if (_pending.containsKey(path)) {
       return _pending[path];
     }
-    final fut = _gen(path);
-    _pending[path] = fut;
-    final result = await fut;
-    _pending.remove(path);
-    if (_map.length >= _max) {
-      _map.remove(_map.keys.first);
-    }
-    _map[path] = result;
-    return result;
+    final completer = Completer<Uint8List?>();
+    _pending[path] = completer.future;
+    _queue.add(_QueuedTask(path, completer));
+    _processQueue();
+    return completer.future;
   }
 
-  static Future<Uint8List?> _gen(String path) async {
+  static void _processQueue() {
+    while (_activeCount < _maxActive && _queue.isNotEmpty) {
+      final task = _queue.removeAt(0);
+      _activeCount++;
+      _generate(task.path, task.completer);
+    }
+  }
+
+  static void _generate(String path, Completer<Uint8List?> completer) async {
+    Uint8List? result;
     try {
-      return await VideoThumbnail.thumbnailData(
+      result = await VideoThumbnail.thumbnailData(
         video: path,
         imageFormat: ImageFormat.JPEG,
         maxWidth: 256,
@@ -48,9 +59,24 @@ class _ThumbCache {
         timeMs: 500,
       );
     } catch (_) {
-      return null;
+      result = null;
+    } finally {
+      if (_map.length >= _max) {
+        _map.remove(_map.keys.first);
+      }
+      _map[path] = result;
+      _pending.remove(path);
+      completer.complete(result);
+      _activeCount--;
+      _processQueue();
     }
   }
+}
+
+class _QueuedTask {
+  final String path;
+  final Completer<Uint8List?> completer;
+  _QueuedTask(this.path, this.completer);
 }
 
 // ══════════════════════════════════════════════════════
@@ -113,6 +139,7 @@ class RFile {
   final int size;
   final int confidence;
   final DateTime? modifiedDate;
+  final bool isDeleted; // true = confirmed deleted/trashed, false = orphaned/unknown
   bool selected;
 
   RFile({
@@ -122,6 +149,7 @@ class RFile {
     required this.size,
     required this.confidence,
     this.modifiedDate,
+    this.isDeleted = true,
     this.selected = false,
   });
 
@@ -145,6 +173,15 @@ class RFile {
 
   bool get isImage => type == FileType.image;
   bool get isVideo => type == FileType.video;
+  bool get isAudio => type == FileType.audio;
+  bool get isDocument => type == FileType.document;
+  bool get isPdf => name.split('.').last.toLowerCase() == 'pdf';
+
+  // HEIC/HEIF detection
+  bool get isHeic {
+    final ext = name.split('.').last.toLowerCase();
+    return ext == 'heic' || ext == 'heif';
+  }
 }
 
 extension _CA on Color {
@@ -169,110 +206,169 @@ class _ScanMsg {
   const _ScanMsg(this.files, this.step, this.progress, this.done);
 }
 
-Future<void> _scanIsolate(SendPort port) async {
-  const roots = [
-    '/storage/emulated/0/DCIM',
-    '/storage/emulated/0/DCIM/Camera',
-    '/storage/emulated/0/Pictures',
-    '/storage/emulated/0/Movies',
-    '/storage/emulated/0/Download',
-    '/storage/emulated/0/Music',
-    '/storage/emulated/0/Documents',
-    '/storage/emulated/0/WhatsApp/Media/WhatsApp Images',
-    '/storage/emulated/0/WhatsApp/Media/WhatsApp Video',
-    '/storage/emulated/0/WhatsApp/Media/WhatsApp Documents',
-    '/storage/emulated/0/Telegram',
-    '/storage/emulated/0/Android/media',
-  ];
-  const img = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'heic', 'heif'};
-  const vid = {'mp4', 'mkv', 'avi', 'mov', '3gp', 'flv', 'wmv', 'ts', 'm4v', 'webm'};
-  const aud = {'mp3', 'm4a', 'wav', 'ogg', 'flac', 'aac', 'wma', 'opus'};
-  const doc = {'pdf', 'doc', 'docx', 'txt', 'xlsx', 'xls', 'pptx', 'ppt', 'csv'};
+// Startup message sent TO the isolate carrying the live-paths set
+class _IsolateArgs {
+  final SendPort port;
+  final Set<String> livePaths; // files currently in MediaStore (to exclude)
+  _IsolateArgs(this.port, this.livePaths);
+}
 
-  final found = <Map<String, dynamic>>[];
-  int done = 0;
+// ── Junk path filter ──
+bool _isJunkPath(String path) {
+  final p = path.toLowerCase();
+  return p.contains('/.thumbnails/') ||
+      p.contains('/thumbnails/') ||
+      p.contains('/.trashed') ||
+      p.contains('/.trash/') ||
+      p.contains('/cache/') ||
+      p.contains('/.cache/') ||
+      p.contains('/android/data/com.') ||
+      p.contains('/android/data/org.') ||
+      p.contains('/android/obb/') ||
+      p.contains('/.android_secure/') ||
+      p.contains('/lost+found/') ||
+      p.contains('/.nomedia') ||
+      p.contains('/albumthumbs/') ||
+      p.endsWith('.tmp') ||
+      p.endsWith('.partial') ||
+      p.endsWith('.crdownload') ||
+      p.endsWith('.download');
+}
 
-  for (final root in roots) {
-    done++;
-    final dir = Directory(root);
-    port.send(_ScanMsg(
-      const [],
-      'Scanning ${root.split('/').last}…',
-      (done * 80 ~/ roots.length),
-      false,
-    ));
-    if (!dir.existsSync()) {
-      continue;
-    }
-    try {
-      for (final e in dir.listSync(recursive: true, followLinks: false)) {
-        if (e is! File) {
-          continue;
-        }
-        try {
-          final ext = e.path.split('.').last.toLowerCase();
-          String? t;
-          int conf = 75;
-          if (img.contains(ext)) {
-            t = 'image';
-            conf = 90;
-          } else if (vid.contains(ext)) {
-            t = 'video';
-            conf = 88;
-          } else if (aud.contains(ext)) {
-            t = 'audio';
-            conf = 85;
-          } else if (doc.contains(ext)) {
-            t = 'document';
-            conf = 80;
-          }
-          if (t == null) {
-            continue;
-          }
-          final st = e.statSync();
-          if (st.size <= 0) {
-            continue;
-          }
-          found.add({
-            'n': e.path.split('/').last,
-            'p': e.path,
-            't': t,
-            's': st.size,
-            'c': conf,
-            'm': st.modified.millisecondsSinceEpoch,
-          });
-          if (found.length % 40 == 0) {
-            port.send(_ScanMsg(
-              List.from(found),
-              'Found ${found.length} files…',
-              (done * 80 ~/ roots.length),
-              false,
-            ));
-          }
-        } catch (_) {}
-      }
-    } catch (_) {}
+bool _isInNomediaDir(String path, Set<String> nomediaDirs) {
+  for (final d in nomediaDirs) {
+    if (path.startsWith(d)) return true;
   }
-  port.send(_ScanMsg(found, 'Done! ${found.length} files found', 100, true));
+  return false;
+}
+
+// ── Orphan scanner isolate ──
+// Walks the filesystem and returns ONLY files that are NOT in MediaStore's
+// live set — i.e. files that exist on disk but MediaStore no longer tracks.
+// These are orphaned/deleted files that weren't caught by the trash query.
+Future<void> _scanIsolate(_IsolateArgs args) async {
+  final SendPort port    = args.port;
+  final Set<String> live = args.livePaths; // excluded set
+
+  const img = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'heic', 'heif', 'tiff', 'tif'};
+  const vid = {'mp4', 'mkv', 'avi', 'mov', '3gp', 'flv', 'wmv', 'ts', 'm4v', 'webm', 'vob', 'mpg', 'mpeg', 'rm', 'rmvb', 'f4v'};
+  const aud = {'mp3', 'm4a', 'wav', 'ogg', 'flac', 'aac', 'wma', 'opus', 'amr', 'mid', 'midi', 'ape', 'ac3'};
+  const doc = {'pdf', 'doc', 'docx', 'txt', 'xlsx', 'xls', 'pptx', 'ppt', 'csv', 'rtf', 'odt', 'ods', 'odp', 'epub'};
+
+  const roots = [
+    '/storage/emulated/0',
+    '/storage/sdcard0',
+    '/storage/sdcard1',
+    '/storage/extSdCard',
+    '/storage/external_SD',
+    '/mnt/sdcard',
+    '/mnt/extSdCard',
+  ];
+
+  const skipDirs = {
+    'Android/obb', '.thumbnails', 'thumbnails', 'cache', '.cache',
+    '.trash', '.Trash', 'lost+found', '.android_secure', 'albumthumbs',
+    'AlbumArt', 'tmp', '.tmp', 'Recycler', 'RECYCLER', r'$RECYCLE.BIN',
+  };
+
+  final found       = <Map<String, dynamic>>[];
+  final seen        = <String>{};
+  final nomediaDirs = <String>{};
+
+  void scanDir(Directory dir, int depth) {
+    if (depth > 8) return;
+
+    List<FileSystemEntity> entries;
+    try {
+      entries = dir.listSync(recursive: false, followLinks: false);
+    } catch (_) { return; }
+
+    // Detect .nomedia — skip whole directory
+    if (entries.any((e) => e is File && e.path.split('/').last == '.nomedia')) {
+      nomediaDirs.add(dir.path.endsWith('/') ? dir.path : '${dir.path}/');
+      return;
+    }
+
+    for (final e in entries) {
+      final name      = e.path.split('/').last;
+      final nameLower = name.toLowerCase();
+
+      if (e is Directory) {
+        if (skipDirs.any((s) => nameLower == s.toLowerCase() || e.path.contains('/$s'))) continue;
+        if (name.startsWith('.')) continue;
+        scanDir(e, depth + 1);
+        continue;
+      }
+
+      if (e is! File) continue;
+      if (_isJunkPath(e.path)) continue;
+      if (_isInNomediaDir(e.path, nomediaDirs)) continue;
+
+      // ── KEY FILTER: skip files that are still live in MediaStore ──
+      // live set is empty on Android < 10 so this never wrongly excludes.
+      if (live.contains(e.path)) continue;
+
+      final dot = name.lastIndexOf('.');
+      if (dot <= 0) continue;
+      final ext = name.substring(dot + 1).toLowerCase();
+
+      String? t; int conf;
+      if (img.contains(ext))      { t = 'image';    conf = 88; }
+      else if (vid.contains(ext)) { t = 'video';    conf = 85; }
+      else if (aud.contains(ext)) { t = 'audio';    conf = 83; }
+      else if (doc.contains(ext)) { t = 'document'; conf = 80; }
+      else continue;
+
+      final absPath = e.path;
+      if (seen.contains(absPath)) continue;
+      seen.add(absPath);
+
+      try {
+        final st = e.statSync();
+        if (st.size <= 0) continue;
+        if (t == 'image'    && st.size < 1024)  continue;
+        if (t == 'video'    && st.size < 10240) continue;
+        if (t == 'audio'    && st.size < 4096)  continue;
+        if (t == 'document' && st.size < 512)   continue;
+
+        found.add({
+          'n':   name,
+          'p':   absPath,
+          't':   t,
+          's':   st.size,
+          'c':   conf,
+          'm':   st.modified.millisecondsSinceEpoch,
+          'del': false, // orphaned — not confirmed deleted by MediaStore
+        });
+
+        if (found.length % 50 == 0) {
+          port.send(_ScanMsg(List.from(found), 'Found ${found.length} orphaned files…', -1, false));
+        }
+      } catch (_) {}
+    }
+  }
+
+  int rootsDone = 0;
+  for (final rootPath in roots) {
+    rootsDone++;
+    final dir = Directory(rootPath);
+    if (!dir.existsSync()) continue;
+    port.send(_ScanMsg(const [], 'Deep scanning ${rootPath.split('/').last}…', (rootsDone * 60 ~/ roots.length), false));
+    scanDir(dir, 0);
+  }
+
+  found.sort((a, b) => (b['m'] as int).compareTo(a['m'] as int));
+  port.send(_ScanMsg(found, 'Deep scan done — ${found.length} orphaned files', 100, true));
 }
 
 RFile _fromMap(Map<String, dynamic> m) {
   FileType t;
   switch (m['t']) {
-    case 'image':
-      t = FileType.image;
-      break;
-    case 'video':
-      t = FileType.video;
-      break;
-    case 'audio':
-      t = FileType.audio;
-      break;
-    case 'document':
-      t = FileType.document;
-      break;
-    default:
-      t = FileType.other;
+    case 'image':    t = FileType.image;    break;
+    case 'video':    t = FileType.video;    break;
+    case 'audio':    t = FileType.audio;    break;
+    case 'document': t = FileType.document; break;
+    default:         t = FileType.other;
   }
   return RFile(
     name: m['n'] as String,
@@ -280,6 +376,7 @@ RFile _fromMap(Map<String, dynamic> m) {
     type: t,
     size: m['s'] as int,
     confidence: m['c'] as int,
+    isDeleted: m['del'] == true,
     modifiedDate: m['m'] != null
         ? DateTime.fromMillisecondsSinceEpoch(m['m'] as int)
         : null,
@@ -287,10 +384,57 @@ RFile _fromMap(Map<String, dynamic> m) {
 }
 
 // ══════════════════════════════════════════════════════
-//  PERMISSION CHANNEL
+//  PERMISSION / SCAN CHANNEL
 // ══════════════════════════════════════════════════════
 
 const _ch = MethodChannel('com.example.recovery_app/permissions');
+
+// ── Fetch deleted/trashed files from MediaStore (Android 10+) ──
+// Returns only files where IS_TRASHED=1 or IS_PENDING=1.
+// On older Android or on error, returns empty list.
+Future<List<RFile>> _fetchDeletedFiles() async {
+  try {
+    final raw = await _ch.invokeMethod<List<dynamic>>('scanDeletedFiles');
+    if (raw == null || raw.isEmpty) return [];
+    return raw.map((e) {
+      final m = Map<String, dynamic>.from(e as Map);
+      FileType t;
+      switch (m['t'] as String?) {
+        case 'image':    t = FileType.image;    break;
+        case 'video':    t = FileType.video;    break;
+        case 'audio':    t = FileType.audio;    break;
+        case 'document': t = FileType.document; break;
+        default:         t = FileType.other;
+      }
+      return RFile(
+        name: m['n'] as String? ?? '',
+        path: m['p'] as String? ?? '',
+        type: t,
+        size: (m['s'] as num?)?.toInt() ?? 0,
+        confidence: 92,
+        isDeleted: true,
+        modifiedDate: m['m'] != null
+            ? DateTime.fromMillisecondsSinceEpoch((m['m'] as num).toInt())
+            : null,
+      );
+    }).where((f) => f.path.isNotEmpty && f.size > 0).toList();
+  } catch (_) {
+    return [];
+  }
+}
+
+// ── Fetch all live (non-deleted) paths from MediaStore ──
+// Used by the isolate scanner to subtract live files, leaving only
+// orphaned files that are no longer tracked by MediaStore.
+Future<Set<String>> _fetchLivePaths() async {
+  try {
+    final raw = await _ch.invokeMethod<List<dynamic>>('getLivePaths');
+    if (raw == null) return {};
+    return raw.cast<String>().toSet();
+  } catch (_) {
+    return {};
+  }
+}
 
 // ══════════════════════════════════════════════════════
 //  MAIN
@@ -324,16 +468,11 @@ class RecoveryApp extends StatelessWidget {
           primary: Color(0xFF00E5FF),
           surface: Color(0xFF0D1321),
         ),
+        // 🔴 FIXED: disable built‑in scrollbars so only custom one appears
         scrollbarTheme: ScrollbarThemeData(
-          thumbColor: WidgetStateProperty.all(
-            const Color(0xFF00E5FF).withValues(alpha: 0.6),
-          ),
-          trackColor: WidgetStateProperty.all(const Color(0xFF1A2740)),
-          thickness: WidgetStateProperty.all(6),
-          radius: const Radius.circular(4),
-          thumbVisibility: WidgetStateProperty.all(true),
-          trackVisibility: WidgetStateProperty.all(true),
-          interactive: true,
+          thumbVisibility: WidgetStateProperty.all(false),
+          trackVisibility: WidgetStateProperty.all(false),
+          thickness: WidgetStateProperty.all(0),
         ),
       ),
       home: const PermissionScreen(),
@@ -816,6 +955,7 @@ class ScanScreen extends StatefulWidget {
 class _ScanScreenState extends State<ScanScreen> with TickerProviderStateMixin {
   late AnimationController _radar;
   double _progress = 0;
+  bool _indeterminate = false; // true = show indeterminate progress bar
   String _step = 'Starting scan…';
   List<RFile> _files = [];
   bool _done = false;
@@ -833,31 +973,88 @@ class _ScanScreenState extends State<ScanScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _startScan() async {
+    // ── Phase 1: MediaStore trash query (Android 10+) ──
+    // Fast, authoritative — returns files user deleted (moved to trash).
+    setState(() {
+      _step = 'Checking trash & deleted items…';
+      _progress = 0.05;
+      _indeterminate = false;
+    });
+
+    final deletedFiles = await _fetchDeletedFiles();
+    if (deletedFiles.isNotEmpty && mounted) {
+      setState(() {
+        _files = deletedFiles;
+        _step = 'Found ${deletedFiles.length} deleted items, deep scanning…';
+        _progress = 0.20;
+      });
+    }
+
+    // ── Phase 2: Get live paths from MediaStore ──
+    // We send this set to the isolate so it can exclude live files.
+    setState(() {
+      _step = 'Building live file index…';
+      _progress = 0.25;
+    });
+    final livePaths = await _fetchLivePaths();
+
+    // ── Phase 3: Filesystem orphan scan (background isolate) ──
+    // Finds files on disk that MediaStore no longer tracks (orphaned).
     _port = ReceivePort();
     try {
-      _iso = await Isolate.spawn(_scanIsolate, _port!.sendPort);
+      _iso = await Isolate.spawn(
+        _scanIsolate,
+        _IsolateArgs(_port!.sendPort, livePaths),
+      );
     } catch (e) {
+      // Isolate failed — use trash results only
       if (mounted) {
-        setState(() {
-          _step = 'Scan error: $e';
-        });
+        if (deletedFiles.isNotEmpty) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) => ResultScreen(files: List.from(deletedFiles)),
+            ),
+          );
+        } else {
+          setState(() => _step = 'Scan error: $e');
+        }
       }
       return;
     }
+
     _port!.listen((msg) {
-      if (msg is! _ScanMsg || !mounted) {
-        return;
-      }
+      if (msg is! _ScanMsg || !mounted) return;
+
       setState(() {
         if (msg.files.isNotEmpty) {
-          _files = msg.files.map(_fromMap).toList();
+          // Merge: trash results (del:true, conf:92) + orphaned filesystem
+          // results (del:false, lower conf). Dedup by path — trash wins.
+          final merged = <String, RFile>{};
+          for (final f in deletedFiles) {
+            merged[f.path] = f;
+          }
+          for (final raw in msg.files) {
+            final f = _fromMap(raw);
+            if (!merged.containsKey(f.path)) {
+              merged[f.path] = f;
+            }
+          }
+          _files = merged.values.toList();
         }
+
         _step = msg.step;
-        _progress = msg.progress / 100.0;
+        if (msg.progress < 0) {
+          _indeterminate = true;
+        } else {
+          _indeterminate = false;
+          _progress = 0.25 + (msg.progress / 100.0) * 0.75;
+        }
         _done = msg.done;
       });
+
       if (msg.done) {
-        Future.delayed(const Duration(milliseconds: 500), () {
+        Future.delayed(const Duration(milliseconds: 400), () {
           if (mounted) {
             Navigator.pushReplacement(
               context,
@@ -903,7 +1100,7 @@ class _ScanScreenState extends State<ScanScreen> with TickerProviderStateMixin {
                   ),
                   const SizedBox(width: 16),
                   Text(
-                    _done ? 'COMPLETE' : 'SCANNING…',
+                    _done ? 'SCAN COMPLETE' : 'SCANNING DELETED FILES…',
                     style: const TextStyle(
                       color: Color(0xFF00E5FF),
                       fontSize: 14,
@@ -958,12 +1155,18 @@ class _ScanScreenState extends State<ScanScreen> with TickerProviderStateMixin {
               const SizedBox(height: 32),
               ClipRRect(
                 borderRadius: BorderRadius.circular(6),
-                child: LinearProgressIndicator(
-                  value: _progress,
-                  backgroundColor: const Color(0xFF1A2740),
-                  valueColor: const AlwaysStoppedAnimation(Color(0xFF00E5FF)),
-                  minHeight: 8,
-                ),
+                child: _indeterminate
+                    ? const LinearProgressIndicator(
+                        backgroundColor: Color(0xFF1A2740),
+                        valueColor: AlwaysStoppedAnimation(Color(0xFF00E5FF)),
+                        minHeight: 8,
+                      )
+                    : LinearProgressIndicator(
+                        value: _progress,
+                        backgroundColor: const Color(0xFF1A2740),
+                        valueColor: const AlwaysStoppedAnimation(Color(0xFF00E5FF)),
+                        minHeight: 8,
+                      ),
               ),
               const SizedBox(height: 14),
               Text(
@@ -973,7 +1176,9 @@ class _ScanScreenState extends State<ScanScreen> with TickerProviderStateMixin {
               ),
               const SizedBox(height: 8),
               Text(
-                '${(_progress * 100).toInt()}%',
+                _indeterminate
+                    ? '…'
+                    : '${(_progress * 100).toInt()}%',
                 style: const TextStyle(
                   color: Color(0xFF00E5FF),
                   fontSize: 40,
@@ -1029,6 +1234,25 @@ class _ResultScreenState extends State<ResultScreen> {
   final _scrollCtrl = ScrollController();
   final _searchCtrl = TextEditingController();
   bool _showSearch = false;
+
+  // custom scrollbar state
+  double _scrollFraction = 0.0;
+  bool _isDraggingScrollbar = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollCtrl.addListener(() {
+      if (_scrollCtrl.hasClients &&
+          _scrollCtrl.position.maxScrollExtent > 0 &&
+          !_isDraggingScrollbar) {
+        setState(() {
+          _scrollFraction =
+              _scrollCtrl.offset / _scrollCtrl.position.maxScrollExtent;
+        });
+      }
+    });
+  }
 
   List<RFile> get _shown {
     var list = _filter == null
@@ -1214,11 +1438,129 @@ class _ResultScreenState extends State<ResultScreen> {
             _filterBar(),
             _viewToggle(),
             _stats(),
-            Expanded(child: widget.files.isEmpty ? _empty() : _content()),
+            Expanded(
+              child: widget.files.isEmpty
+                  ? _empty()
+                  : Stack(children: [
+                      _content(),
+                      _customScrollbar(), // 🔴 FIXED: direct child of Stack
+                    ]),
+            ),
             if (_selCount > 0) _bottomBar(),
           ],
         ),
       ),
+    );
+  }
+
+  // 🔴 FIXED: Positioned is direct child of Stack; LayoutBuilder inside it
+  Widget _customScrollbar() {
+    return Positioned(
+      right: 1,
+      top: 0,
+      bottom: 0,
+      width: 18,
+      child: LayoutBuilder(builder: (ctx, constraints) {
+        const thumbH = 56.0;
+        const edgePad = 12.0;
+        final trackH = constraints.maxHeight - edgePad * 2;
+        final maxOffset = (trackH - thumbH).clamp(0.0, double.infinity);
+        final thumbTop = edgePad + (_scrollFraction * maxOffset).clamp(0.0, maxOffset);
+
+        return GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onVerticalDragStart: (_) => setState(() => _isDraggingScrollbar = true),
+          onVerticalDragUpdate: (d) {
+            if (!_scrollCtrl.hasClients) return;
+            final frac = ((d.localPosition.dy - thumbH / 2 - edgePad) / maxOffset)
+                .clamp(0.0, 1.0);
+            setState(() => _scrollFraction = frac);
+            _scrollCtrl.jumpTo(frac * _scrollCtrl.position.maxScrollExtent);
+          },
+          onVerticalDragEnd: (_) => setState(() => _isDraggingScrollbar = false),
+          onVerticalDragCancel: () => setState(() => _isDraggingScrollbar = false),
+          child: Stack(clipBehavior: Clip.none, children: [
+            // Track
+            Positioned(
+              top: edgePad,
+              bottom: edgePad,
+              left: 7,
+              width: 3,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1A2740),
+                  borderRadius: BorderRadius.circular(3),
+                ),
+              ),
+            ),
+            // Thumb
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 30),
+              top: thumbTop,
+              left: 2,
+              width: 13,
+              height: thumbH,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 150),
+                decoration: BoxDecoration(
+                  color: _isDraggingScrollbar
+                      ? const Color(0xFF00E5FF)
+                      : const Color(0xFF00E5FF).withA(0.55),
+                  borderRadius: BorderRadius.circular(7),
+                  boxShadow: _isDraggingScrollbar
+                      ? [BoxShadow(
+                          color: const Color(0xFF00E5FF).withA(0.5),
+                          blurRadius: 12,
+                        )]
+                      : [],
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    for (int i = 0; i < 3; i++) ...[
+                      if (i > 0) const SizedBox(height: 3),
+                      Container(
+                        width: 7,
+                        height: 1.5,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withA(0.7),
+                          borderRadius: BorderRadius.circular(1),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            // Floating % label while dragging
+            if (_isDraggingScrollbar)
+              Positioned(
+                top: (thumbTop + thumbH / 2 - 14)
+                    .clamp(0.0, constraints.maxHeight - 28.0),
+                right: 20,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0D1321),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF00E5FF).withA(0.5)),
+                    boxShadow: [
+                      BoxShadow(color: Colors.black.withA(0.4), blurRadius: 8),
+                    ],
+                  ),
+                  child: Text(
+                    '${(_scrollFraction * 100).toInt()}%',
+                    style: const TextStyle(
+                      color: Color(0xFF00E5FF),
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+          ]),
+        );
+      }),
     );
   }
 
@@ -1241,7 +1583,7 @@ class _ResultScreenState extends State<ResultScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'RECOVERY RESULTS',
+                  'DELETED FILES',
                   style: TextStyle(
                     color: Color(0xFF00E5FF),
                     fontSize: 14,
@@ -1250,7 +1592,7 @@ class _ResultScreenState extends State<ResultScreen> {
                   ),
                 ),
                 Text(
-                  'Tap = Open   Long Press = Select',
+                  'Tap = Preview   Long Press = Select',
                   style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 10),
                 ),
               ],
@@ -1458,12 +1800,22 @@ class _ResultScreenState extends State<ResultScreen> {
   }
 
   Widget _stats() {
+    final deletedCount = _shown.where((f) => f.isDeleted).length;
+    final orphanCount  = _shown.where((f) => !f.isDeleted).length;
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 4),
       child: Row(
         children: [
-          _badge('${_shown.length}', 'Files', const Color(0xFF00E5FF)),
+          _badge('${_shown.length}', 'Total', const Color(0xFF00E5FF)),
           const SizedBox(width: 12),
+          if (deletedCount > 0) ...[
+            _badge('$deletedCount', 'Deleted', const Color(0xFFFF4081)),
+            const SizedBox(width: 12),
+          ],
+          if (orphanCount > 0) ...[
+            _badge('$orphanCount', 'Orphaned', const Color(0xFFFFD740)),
+            const SizedBox(width: 12),
+          ],
           _badge('$_selCount', 'Selected', const Color(0xFF69FF47)),
         ],
       ),
@@ -1481,19 +1833,49 @@ class _ResultScreenState extends State<ResultScreen> {
   }
 
   Widget _empty() {
-    return const Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.search_off, color: Color(0xFF1A2740), size: 64),
-          SizedBox(height: 16),
-          Text('No files found', style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 16)),
-          SizedBox(height: 8),
-          Text(
-            'Grant storage permission and try again',
-            style: TextStyle(color: Color(0xFF2A3F5F), fontSize: 13),
-          ),
-        ],
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.search_off, color: Color(0xFF1A2740), size: 64),
+            const SizedBox(height: 16),
+            const Text(
+              'No deleted files found',
+              style: TextStyle(color: Color(0xFF4A6FA5), fontSize: 16),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'On Android 11+, grant "All Files Access" for best results.\n'
+              'Recently deleted files may appear in Gallery trash.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Color(0xFF2A3F5F), fontSize: 13, height: 1.6),
+            ),
+            const SizedBox(height: 20),
+            GestureDetector(
+              onTap: () => Navigator.pop(context),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF00E5FF).withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: const Color(0xFF00E5FF).withValues(alpha: 0.4),
+                  ),
+                ),
+                child: const Text(
+                  'Back & Try Again',
+                  style: TextStyle(
+                    color: Color(0xFF00E5FF),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1508,23 +1890,19 @@ class _ResultScreenState extends State<ResultScreen> {
     return _gallery ? _gridView(list) : _listView(list);
   }
 
-  // ── GRID ──
+  // ── GRID ── (no built‑in scrollbar, custom scrollbar only)
   Widget _gridView(List<RFile> list) {
-    return Scrollbar(
+    return GridView.builder(
       controller: _scrollCtrl,
-      interactive: true,
-      child: GridView.builder(
-        controller: _scrollCtrl,
-        padding: const EdgeInsets.all(10),
-        cacheExtent: 800,
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 3,
-          crossAxisSpacing: 4,
-          mainAxisSpacing: 4,
-        ),
-        itemCount: list.length,
-        itemBuilder: (_, i) => RepaintBoundary(child: _gridItem(list[i])),
+      padding: const EdgeInsets.fromLTRB(10, 10, 22, 10),
+      cacheExtent: 800,
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        crossAxisSpacing: 4,
+        mainAxisSpacing: 4,
       ),
+      itemCount: list.length,
+      itemBuilder: (_, i) => RepaintBoundary(child: _gridItem(list[i])),
     );
   }
 
@@ -1553,6 +1931,27 @@ class _ResultScreenState extends State<ResultScreen> {
           if (f.isVideo && !f.selected)
             const Center(
               child: Icon(Icons.play_circle_fill, color: Colors.white70, size: 30),
+            ),
+          if (f.isAudio && !f.selected)
+            const Center(
+              child: Icon(Icons.music_note_rounded, color: Color(0xFFFFD740), size: 30),
+            ),
+          // Deleted / Orphan badge — top left
+          if (!f.selected)
+            Positioned(
+              top: 4,
+              left: 4,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.black.withA(0.65),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  f.isDeleted ? '🗑' : '👻',
+                  style: const TextStyle(fontSize: 9),
+                ),
+              ),
             ),
           if (!f.isImage && !f.isVideo)
             Positioned(
@@ -1596,17 +1995,13 @@ class _ResultScreenState extends State<ResultScreen> {
     );
   }
 
-  // ── LIST ──
+  // ── LIST ── (no built‑in scrollbar, custom scrollbar only)
   Widget _listView(List<RFile> list) {
-    return Scrollbar(
+    return ListView.builder(
       controller: _scrollCtrl,
-      interactive: true,
-      child: ListView.builder(
-        controller: _scrollCtrl,
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        itemCount: list.length,
-        itemBuilder: (_, i) => RepaintBoundary(child: _listItem(list[i])),
-      ),
+      padding: const EdgeInsets.fromLTRB(14, 8, 22, 8),
+      itemCount: list.length,
+      itemBuilder: (_, i) => RepaintBoundary(child: _listItem(list[i])),
     );
   }
 
@@ -1684,6 +2079,33 @@ class _ResultScreenState extends State<ResultScreen> {
                         '${f.confidence}%',
                         style: TextStyle(color: f.type.color, fontSize: 10),
                       ),
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: f.isDeleted
+                              ? const Color(0xFFFF4081).withA(0.15)
+                              : const Color(0xFFFFD740).withA(0.15),
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(
+                            color: f.isDeleted
+                                ? const Color(0xFFFF4081).withA(0.5)
+                                : const Color(0xFFFFD740).withA(0.5),
+                            width: 0.8,
+                          ),
+                        ),
+                        child: Text(
+                          f.isDeleted ? 'DELETED' : 'ORPHAN',
+                          style: TextStyle(
+                            color: f.isDeleted
+                                ? const Color(0xFFFF4081)
+                                : const Color(0xFFFFD740),
+                            fontSize: 7,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ),
                     ],
                   ),
                 ],
@@ -1714,6 +2136,29 @@ class _ResultScreenState extends State<ResultScreen> {
 
   Widget _thumb(RFile f) {
     if (f.isImage) {
+      // 🔴 FIXED: HEIC/HEIF files cause crash – show a styled placeholder
+      if (f.isHeic) {
+        return Container(
+          color: f.type.color.withA(0.12),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(f.type.icon, color: f.type.color.withA(0.7), size: 32),
+                const SizedBox(height: 4),
+                const Text(
+                  'HEIC/HEIF',
+                  style: TextStyle(color: Colors.white70, fontSize: 8),
+                ),
+                const Text(
+                  'Save to view',
+                  style: TextStyle(color: Colors.white54, fontSize: 6),
+                ),
+              ],
+            ),
+          ),
+        );
+      }
       return Image.file(
         File(f.path),
         fit: BoxFit.cover,
@@ -1848,7 +2293,7 @@ class _ResultScreenState extends State<ResultScreen> {
 }
 
 // ══════════════════════════════════════════════════════
-//  VIDEO THUMBNAIL  (async + LRU cached)
+//  VIDEO THUMBNAIL  (async + LRU cached + concurrency limit)
 // ══════════════════════════════════════════════════════
 
 class _VideoThumb extends StatefulWidget {
@@ -1941,6 +2386,14 @@ class PreviewScreen extends StatelessWidget {
         ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.info_outline_rounded, color: Color(0xFF00E5FF)),
+            onPressed: () => _showInfo(context),
+          ),
+          IconButton(
+            icon: const Icon(Icons.share_rounded, color: Color(0xFFFFD740)),
+            onPressed: () => _share(context),
+          ),
+          IconButton(
             icon: const Icon(Icons.download_rounded, color: Color(0xFF00E5FF)),
             onPressed: () => _save(context),
           ),
@@ -1956,6 +2409,39 @@ class PreviewScreen extends StatelessWidget {
 
   Widget _body(BuildContext context) {
     if (file.isImage) {
+      // 🔴 FIXED: Show a clear message for HEIC instead of crashing
+      if (file.isHeic) {
+        return Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 120,
+                height: 120,
+                decoration: BoxDecoration(
+                  color: file.type.color.withA(0.15),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  file.type.icon,
+                  color: file.type.color,
+                  size: 60,
+                ),
+              ),
+              const SizedBox(height: 24),
+              const Text(
+                'HEIC/HEIF Preview Unavailable',
+                style: TextStyle(color: Colors.white, fontSize: 16),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Save to view in Gallery app',
+                style: TextStyle(color: Colors.grey, fontSize: 13),
+              ),
+            ],
+          ),
+        );
+      }
       return PhotoView(
         imageProvider: FileImage(File(file.path)),
         minScale: PhotoViewComputedScale.contained,
@@ -1972,10 +2458,88 @@ class PreviewScreen extends StatelessWidget {
         errorBuilder: (_, _, _) => Center(child: _noPreview()),
       );
     }
-    if (file.isVideo) {
-      return _VideoPlayer(file: file);
-    }
+    if (file.isVideo) return _VideoPlayer(file: file);
+    if (file.isAudio) return _AudioPlayerWidget(file: file);
+    if (file.isPdf)   return _PdfViewerWidget(file: file);
     return Center(child: _noPreview());
+  }
+
+  void _showInfo(BuildContext ctx) {
+    showDialog(
+      context: ctx,
+      builder: (_) => Dialog(
+        backgroundColor: const Color(0xFF0D1321),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                Icon(file.type.icon, color: file.type.color, size: 30),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    file.name,
+                    style: const TextStyle(
+                        color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ]),
+              const Divider(color: Color(0xFF1A2740), height: 24),
+              _infoRow('Type',       file.type.label),
+              _infoRow('Size',       file.sizeLabel),
+              _infoRow('Date',       file.dateLabel.isEmpty ? 'Unknown' : file.dateLabel),
+              _infoRow('Confidence','${file.confidence}%'),
+              _infoRow('Path',       file.path),
+              const SizedBox(height: 16),
+              Center(
+                child: GestureDetector(
+                  onTap: () => Navigator.pop(ctx),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A2740),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Text('CLOSE',
+                        style: TextStyle(color: Color(0xFF4A6FA5),
+                            fontWeight: FontWeight.bold, fontSize: 13)),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _infoRow(String k, String v) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(
+            width: 80,
+            child: Text(k, style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 12))),
+        Expanded(child: Text(v, style: const TextStyle(color: Colors.white, fontSize: 12))),
+      ]),
+    );
+  }
+
+  void _share(BuildContext ctx) async {
+    try {
+      // ignore: deprecated_member_use
+      await Share.shareXFiles([XFile(file.path)], text: file.name);
+    } catch (e) {
+      if (ctx.mounted) {
+        ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
+          content: Text('Share failed: $e'),
+          backgroundColor: const Color(0xFFFF4081),
+        ));
+      }
+    }
   }
 
   void _save(BuildContext ctx) {
@@ -2058,7 +2622,7 @@ class PreviewScreen extends StatelessWidget {
 }
 
 // ══════════════════════════════════════════════════════
-//  VIDEO PLAYER  (full controls, seek bar, +/- 10s)
+//  VIDEO PLAYER  (surface‑released bug fixed)
 // ══════════════════════════════════════════════════════
 
 class _VideoPlayer extends StatefulWidget {
@@ -2071,6 +2635,8 @@ class _VideoPlayer extends StatefulWidget {
 class _VideoPlayerState extends State<_VideoPlayer> {
   VideoPlayerController? _ctrl;
   bool _ready = false;
+  bool _error = false;
+  String _errorMsg = '';
   bool _showCtrl = true;
   Timer? _hideTimer;
 
@@ -2082,41 +2648,43 @@ class _VideoPlayerState extends State<_VideoPlayer> {
 
   Future<void> _init() async {
     try {
-      _ctrl = VideoPlayerController.file(File(widget.file.path));
-      await _ctrl!.initialize();
-      _ctrl!.addListener(() {
-        if (mounted) {
-          setState(() {});
-        }
-      });
-      if (mounted) {
-        setState(() => _ready = true);
+      final ctrl = VideoPlayerController.file(
+        File(widget.file.path),
+        videoPlayerOptions: VideoPlayerOptions(mixWithOthers: false),
+      );
+      await ctrl.initialize();
+      if (!mounted) {
+        ctrl.dispose();
+        return;
       }
-      _ctrl!.play();
+      ctrl.addListener(() {
+        if (mounted) setState(() {});
+      });
+      setState(() {
+        _ctrl = ctrl;
+        _ready = true;
+      });
+      await ctrl.play();
       _sched();
-    } catch (_) {}
+    } catch (e) {
+      if (mounted) setState(() { _error = true; _errorMsg = e.toString(); });
+    }
   }
 
   void _sched() {
     _hideTimer?.cancel();
     _hideTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() => _showCtrl = false);
-      }
+      if (mounted) setState(() => _showCtrl = false);
     });
   }
 
   void _tap() {
     setState(() => _showCtrl = !_showCtrl);
-    if (_showCtrl) {
-      _sched();
-    }
+    if (_showCtrl) _sched();
   }
 
   void _playPause() {
-    if (_ctrl == null) {
-      return;
-    }
+    if (_ctrl == null) return;
     _ctrl!.value.isPlaying ? _ctrl!.pause() : _ctrl!.play();
     setState(() {});
     _sched();
@@ -2125,7 +2693,9 @@ class _VideoPlayerState extends State<_VideoPlayer> {
   @override
   void dispose() {
     _hideTimer?.cancel();
-    _ctrl?.dispose();
+    final c = _ctrl;
+    _ctrl = null;
+    Future.delayed(const Duration(milliseconds: 300), () => c?.dispose());
     super.dispose();
   }
 
@@ -2138,6 +2708,24 @@ class _VideoPlayerState extends State<_VideoPlayer> {
 
   @override
   Widget build(BuildContext context) {
+    if (_error) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.error_rounded, color: Color(0xFFFF4081), size: 64),
+            const SizedBox(height: 16),
+            const Text('Video could not be played',
+                style: TextStyle(color: Colors.white, fontSize: 15)),
+            const SizedBox(height: 8),
+            Text(_errorMsg,
+                style: const TextStyle(color: Colors.grey, fontSize: 11),
+                textAlign: TextAlign.center),
+          ]),
+        ),
+      );
+    }
+
     if (!_ready || _ctrl == null) {
       return const Center(
         child: Column(
@@ -2300,6 +2888,459 @@ class _VideoPlayerState extends State<_VideoPlayer> {
         ],
       ),
     );
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  AUDIO PLAYER
+// ══════════════════════════════════════════════════════
+
+class _AudioPlayerWidget extends StatefulWidget {
+  final RFile file;
+  const _AudioPlayerWidget({required this.file});
+  @override
+  State<_AudioPlayerWidget> createState() => _AudioPlayerWidgetState();
+}
+
+class _AudioPlayerWidgetState extends State<_AudioPlayerWidget>
+    with TickerProviderStateMixin {
+  final _player = AudioPlayer();
+  bool _ready = false;
+  bool _error = false;
+  late AnimationController _pulseCtrl;
+  late Animation<double> _pulseAnim;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseCtrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 800))
+      ..repeat(reverse: true);
+    _pulseAnim = Tween<double>(begin: 0.88, end: 1.12)
+        .animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
+    _init();
+  }
+
+  Future<void> _init() async {
+    try {
+      await _player.setFilePath(widget.file.path);
+      if (mounted) setState(() => _ready = true);
+    } catch (_) {
+      if (mounted) setState(() => _error = true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _pulseCtrl.dispose();
+    _player.dispose();
+    super.dispose();
+  }
+
+  String _fmt(Duration? d) {
+    if (d == null) return '00:00';
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_error) {
+      return Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.error_rounded, color: Color(0xFFFFD740), size: 64),
+          const SizedBox(height: 16),
+          const Text('Audio could not be played',
+              style: TextStyle(color: Colors.white, fontSize: 15)),
+        ]),
+      );
+    }
+
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: RadialGradient(
+          center: Alignment(0, -0.2),
+          radius: 1.3,
+          colors: [Color(0xFF1A1200), Color(0xFF080C14)],
+        ),
+      ),
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Column(children: [
+            const SizedBox(height: 20),
+            StreamBuilder<PlayerState>(
+              stream: _player.playerStateStream,
+              builder: (_, snap) {
+                final playing = snap.data?.playing ?? false;
+                return AnimatedBuilder(
+                  animation: _pulseAnim,
+                  builder: (_, _) => Transform.scale(
+                    scale: playing ? _pulseAnim.value : 1.0,
+                    child: Container(
+                      width: 200,
+                      height: 200,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        gradient: RadialGradient(colors: [
+                          const Color(0xFFFFD740).withA(0.12),
+                          const Color(0xFF120E00),
+                        ]),
+                        border: Border.all(
+                          color: const Color(0xFFFFD740)
+                              .withA(playing ? 0.8 : 0.3),
+                          width: 2.5,
+                        ),
+                        boxShadow: playing
+                            ? [
+                                BoxShadow(
+                                  color: const Color(0xFFFFD740).withA(0.28),
+                                  blurRadius: 50,
+                                  spreadRadius: 12,
+                                )
+                              ]
+                            : [],
+                      ),
+                      child: Icon(
+                        Icons.music_note_rounded,
+                        color: const Color(0xFFFFD740).withA(playing ? 1.0 : 0.5),
+                        size: 90,
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 28),
+            Text(
+              widget.file.name,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 17,
+                  fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 2,
+            ),
+            const SizedBox(height: 4),
+            Text(widget.file.sizeLabel,
+                style: const TextStyle(color: Color(0xFF4A6FA5), fontSize: 12)),
+            const SizedBox(height: 28),
+            if (_ready)
+              StreamBuilder<Duration>(
+                stream: _player.positionStream,
+                builder: (_, posSnap) {
+                  final pos = posSnap.data ?? Duration.zero;
+                  final dur = _player.duration ?? Duration.zero;
+                  final progress = dur.inMilliseconds > 0
+                      ? pos.inMilliseconds / dur.inMilliseconds
+                      : 0.0;
+                  return Column(children: [
+                    SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        activeTrackColor: const Color(0xFFFFD740),
+                        inactiveTrackColor: Colors.white12,
+                        thumbColor: const Color(0xFFFFD740),
+                        thumbShape:
+                            const RoundSliderThumbShape(enabledThumbRadius: 8),
+                        overlayShape:
+                            const RoundSliderOverlayShape(overlayRadius: 20),
+                        trackHeight: 4,
+                      ),
+                      child: Slider(
+                        value: progress.clamp(0.0, 1.0),
+                        onChanged: (v) => _player.seek(Duration(
+                            milliseconds:
+                                (v * dur.inMilliseconds).toInt())),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text(_fmt(pos),
+                                style: const TextStyle(
+                                    color: Colors.white54, fontSize: 11)),
+                            Text(_fmt(dur),
+                                style: const TextStyle(
+                                    color: Colors.white54, fontSize: 11)),
+                          ]),
+                    ),
+                  ]);
+                },
+              )
+            else
+              Column(children: [
+                const SizedBox(height: 16),
+                const LinearProgressIndicator(
+                    color: Color(0xFFFFD740),
+                    backgroundColor: Colors.white12),
+                const SizedBox(height: 16),
+              ]),
+            const SizedBox(height: 20),
+            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              GestureDetector(
+                onTap: () => _player
+                    .seek(_player.position - const Duration(seconds: 15)),
+                child: Container(
+                  width: 52,
+                  height: 52,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFD740).withA(0.1),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.replay_10,
+                      color: Color(0xFFFFD740), size: 26),
+                ),
+              ),
+              const SizedBox(width: 24),
+              StreamBuilder<PlayerState>(
+                stream: _player.playerStateStream,
+                builder: (_, snap) {
+                  final playing = snap.data?.playing ?? false;
+                  final loading =
+                      snap.data?.processingState == ProcessingState.loading ||
+                          snap.data?.processingState ==
+                              ProcessingState.buffering;
+                  return GestureDetector(
+                    onTap: () =>
+                        playing ? _player.pause() : _player.play(),
+                    child: Container(
+                      width: 76,
+                      height: 76,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFFD740),
+                        shape: BoxShape.circle,
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFFFFD740).withA(0.4),
+                            blurRadius: 24,
+                            spreadRadius: 4,
+                          )
+                        ],
+                      ),
+                      child: loading
+                          ? const CircularProgressIndicator(
+                              color: Colors.black, strokeWidth: 3)
+                          : Icon(
+                              playing
+                                  ? Icons.pause_rounded
+                                  : Icons.play_arrow_rounded,
+                              color: Colors.black,
+                              size: 44),
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(width: 24),
+              GestureDetector(
+                onTap: () => _player
+                    .seek(_player.position + const Duration(seconds: 15)),
+                child: Container(
+                  width: 52,
+                  height: 52,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFD740).withA(0.1),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.forward_10,
+                      color: Color(0xFFFFD740), size: 26),
+                ),
+              ),
+            ]),
+            const SizedBox(height: 20),
+            StreamBuilder<double>(
+              stream: _player.speedStream,
+              builder: (_, snap) {
+                final speed = snap.data ?? 1.0;
+                return Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Text('Speed: ',
+                        style: TextStyle(
+                            color: Color(0xFF4A6FA5), fontSize: 12)),
+                    for (final s in [0.5, 0.75, 1.0, 1.5, 2.0])
+                      GestureDetector(
+                        onTap: () => _player.setSpeed(s),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 150),
+                          margin: const EdgeInsets.symmetric(horizontal: 3),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 9, vertical: 5),
+                          decoration: BoxDecoration(
+                            color: speed == s
+                                ? const Color(0xFFFFD740).withA(0.15)
+                                : const Color(0xFF1A2740),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(
+                              color: speed == s
+                                  ? const Color(0xFFFFD740)
+                                  : Colors.transparent,
+                            ),
+                          ),
+                          child: Text(
+                            '${s}x',
+                            style: TextStyle(
+                              color: speed == s
+                                  ? const Color(0xFFFFD740)
+                                  : const Color(0xFF4A6FA5),
+                              fontSize: 11,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              },
+            ),
+            const Spacer(),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  PDF VIEWER
+// ══════════════════════════════════════════════════════
+
+class _PdfViewerWidget extends StatefulWidget {
+  final RFile file;
+  const _PdfViewerWidget({required this.file});
+  @override
+  State<_PdfViewerWidget> createState() => _PdfViewerWidgetState();
+}
+
+class _PdfViewerWidgetState extends State<_PdfViewerWidget> {
+  int _totalPages = 0;
+  int _currentPage = 1;
+  bool _ready = false;
+  bool _error = false;
+  PDFViewController? _pdfCtrl;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(children: [
+      PDFView(
+        filePath: widget.file.path,
+        enableSwipe: true,
+        swipeHorizontal: false,
+        autoSpacing: true,
+        pageFling: true,
+        pageSnap: true,
+        fitPolicy: FitPolicy.BOTH,
+        backgroundColor: Colors.black,
+        onRender: (pages) =>
+            setState(() { _totalPages = pages ?? 0; _ready = true; }),
+        onViewCreated: (ctrl) => setState(() => _pdfCtrl = ctrl),
+        onPageChanged: (page, _) =>
+            setState(() => _currentPage = (page ?? 0) + 1),
+        onError: (_) => setState(() => _error = true),
+        onPageError: (_, _) {},
+      ),
+      if (!_ready && !_error)
+        Container(
+          color: Colors.black87,
+          child: const Center(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              CircularProgressIndicator(color: Color(0xFF69FF47)),
+              SizedBox(height: 14),
+              Text('Loading PDF…',
+                  style: TextStyle(color: Colors.white54, fontSize: 13)),
+            ]),
+          ),
+        ),
+      if (_error)
+        Container(
+          color: Colors.black87,
+          child: const Center(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Icon(Icons.broken_image_rounded,
+                  color: Color(0xFF69FF47), size: 64),
+              SizedBox(height: 16),
+              Text('Could not open PDF',
+                  style: TextStyle(color: Colors.white, fontSize: 15)),
+              SizedBox(height: 8),
+              Text('File may be corrupted or unsupported',
+                  style: TextStyle(color: Colors.grey, fontSize: 12)),
+            ]),
+          ),
+        ),
+      if (_ready && _totalPages > 0)
+        Positioned(
+          bottom: 16,
+          left: 0,
+          right: 0,
+          child: Center(
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF0D1321).withA(0.92),
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: const Color(0xFF1A2740)),
+              ),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                GestureDetector(
+                  onTap: () {
+                    if (_currentPage > 1) _pdfCtrl?.setPage(_currentPage - 2);
+                  },
+                  child: Container(
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      color: _currentPage > 1
+                          ? const Color(0xFF69FF47).withA(0.12)
+                          : Colors.transparent,
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(Icons.chevron_left,
+                        color: _currentPage > 1
+                            ? const Color(0xFF69FF47)
+                            : const Color(0xFF1A2740),
+                        size: 22),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Text(
+                    '$_currentPage / $_totalPages',
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600),
+                  ),
+                ),
+                GestureDetector(
+                  onTap: () {
+                    if (_currentPage < _totalPages) {
+                      _pdfCtrl?.setPage(_currentPage);
+                    }
+                  },
+                  child: Container(
+                    width: 32,
+                    height: 32,
+                    decoration: BoxDecoration(
+                      color: _currentPage < _totalPages
+                          ? const Color(0xFF69FF47).withA(0.12)
+                          : Colors.transparent,
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(Icons.chevron_right,
+                        color: _currentPage < _totalPages
+                            ? const Color(0xFF69FF47)
+                            : const Color(0xFF1A2740),
+                        size: 22),
+                  ),
+                ),
+              ]),
+            ),
+          ),
+        ),
+    ]);
   }
 }
 
